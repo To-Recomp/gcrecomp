@@ -158,6 +158,7 @@ def main():
     def unlimited_stack():
         resource.setrlimit(resource.RLIMIT_STACK, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
 
+    load0 = os.getloadavg()[0]
     logf = open(log_path, "w")
     t_start = time.time()
     proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env, preexec_fn=unlimited_stack)
@@ -202,6 +203,7 @@ def main():
     proc.wait()
     logf.close()
     wall = time.time() - t_start
+    load1 = os.getloadavg()[0]
 
     # Parse the log: [bench] lines are tagged with the segment current when they were printed.
     samples = []  # (segment, dict)
@@ -229,6 +231,8 @@ def main():
 
     result = {"label": args.label, "wall": wall, "segments": {}, "markers": markers, "gp": gp_line, "unresolved": unresolved}
     print(f"== benchmark {args.label or os.path.basename(args.bin)}: {len(samples)} s of samples, {wall:.0f} s wall, bin {args.bin}")
+    print(f"host load average (1 min): {load0:.1f} at start, {load1:.1f} at end ({os.cpu_count()} CPUs): a busy machine starves the "
+          "nice'd game and shows as seconds with low cpu% and low idle%")
     print("time to marker (wall s since start): " + (", ".join(f"{n} {t:.0f}" for n, t, _ in markers) or "none"))
     hdr = f"{'segment':9} {'secs':>5} {'fps':>6} {'min':>6} {'med':>6} {'retrace':>7} {'idle%':>5} {'cpu%':>5} {'disp/s':>8} {'memop/s':>8} {'draws/s':>8}  threads (CPU%)"
     print(hdr)

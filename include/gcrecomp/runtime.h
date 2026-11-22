@@ -238,8 +238,29 @@ struct Memory {
 
     // Translate a GameCube virtual address to a host pointer.
     // Handles both cached (0x80xxxxxx) and uncached (0xC0xxxxxx) ranges.
+    //
+    // The non-const overload is the one that gets written through: it records the RAM page of `addr` as written
+    // (see "Write stamps" below). Code that only reads through the pointer uses the const overload (read_ptr).
     uint8_t* translate(uint32_t addr);
     const uint8_t* translate(uint32_t addr) const;
+    const uint8_t* read_ptr(uint32_t addr) const { return translate(addr); }
+
+    // ---- Write stamps ---------------------------------------------------------------------------------------
+    // Which 4 KB pages of RAM were written since a consumer last looked, so a cache of data derived from guest
+    // memory (the GP's decoded textures) need not re-read all of it to find out that nothing changed.
+    // Every store through write8/16/32/64 and every write through the non-const translate() stamps its page with
+    // `write_clock`; a consumer that validated a range at clock C asks written_since(addr, len, C) later. Code that
+    // writes guest RAM through a host pointer it keeps (memcpy into a buffer, DMA) must call mark_written() for the
+    // whole range. A page is stamped with the clock's value at the store; advance_clock() starts a new epoch.
+    static constexpr uint32_t PAGE_SHIFT = 12;
+    uint32_t write_clock = 1;
+    uint32_t* page_stamp = nullptr;  // one per page of RAM
+    // Starts a new epoch and returns its clock: stores from now on compare >= the returned value.
+    uint32_t advance_clock() { return ++write_clock; }
+    // Stamps the pages of [addr, addr+len) (any guest address of RAM; others are ignored).
+    void mark_written(uint32_t addr, uint32_t len);
+    // True when a store may have touched [addr, addr+len) at or after `clock` (also when the range is not RAM).
+    bool written_since(uint32_t addr, uint32_t len, uint32_t clock) const;
 
     // Big-endian read accessors (match GameCube memory byte order)
     uint8_t  read8(uint32_t addr) const;
@@ -264,6 +285,13 @@ struct Memory {
     uint32_t watch_lo[8] = {};
     uint32_t watch_hi[8] = {};  // exclusive
     void watch_hit(uint32_t addr, uint32_t len, uint64_t value);
+private:
+    uint8_t* translate_impl(uint32_t addr);
+    void mark_host(const uint8_t* p) {
+        const size_t off = size_t(p - ram);
+        if (off < ram_size) page_stamp[off >> PAGE_SHIFT] = write_clock;
+    }
+public:
     void watch_check(uint32_t addr, uint32_t len, uint64_t value) {
         if (watch_count) watch_hit(addr, len, value);
     }

@@ -212,6 +212,9 @@ if(GCRECOMP_BUILD_TESTS AND GCRECOMP_BUILD_RUNTIME)
     target_link_libraries(test_threads PRIVATE gcrecomp_runtime)
     add_test(NAME threads COMMAND test_threads)
     set_tests_properties(threads PROPERTIES TIMEOUT 60)
+    add_executable(memory_stamp_test tests/memory_stamp_test.cpp)
+    target_link_libraries(memory_stamp_test PRIVATE gcrecomp_runtime)
+    add_test(NAME memory_stamp COMMAND memory_stamp_test)
 endif()
 
 # ===========================================================================

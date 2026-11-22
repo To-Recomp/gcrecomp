@@ -464,6 +464,7 @@ static void os_memset(PPCContext* ctx, Memory* mem) {
     uint32_t n = ctx->r[5];
     uint8_t* ptr = mem->translate(dst);
     if (ptr) memset(ptr, val, n);
+    mem->mark_written(dst, n);
     ctx->r[3] = dst; // return dst
 }
 
@@ -472,8 +473,9 @@ static void os_memcpy(PPCContext* ctx, Memory* mem) {
     uint32_t src = ctx->r[4];
     uint32_t n = ctx->r[5];
     uint8_t* d = mem->translate(dst);
-    const uint8_t* s = mem->translate(src);
+    const uint8_t* s = mem->read_ptr(src);
     if (d && s) memcpy(d, s, n);
+    mem->mark_written(dst, n);
     ctx->r[3] = dst;
 }
 
@@ -482,8 +484,9 @@ static void os_memmove(PPCContext* ctx, Memory* mem) {
     uint32_t src = ctx->r[4];
     uint32_t n = ctx->r[5];
     uint8_t* d = mem->translate(dst);
-    const uint8_t* s = mem->translate(src);
+    const uint8_t* s = mem->read_ptr(src);
     if (d && s) memmove(d, s, n);
+    mem->mark_written(dst, n);
     ctx->r[3] = dst;
 }
 
@@ -515,8 +518,9 @@ static void os_strcpy(PPCContext* ctx, Memory* mem) {
     uint32_t dst = ctx->r[3];
     uint32_t src = ctx->r[4];
     char* d = (char*)mem->translate(dst);
-    const char* s = (const char*)mem->translate(src);
+    const char* s = (const char*)mem->read_ptr(src);
     if (d && s) strcpy(d, s);
+    if (d) mem->mark_written(dst, (uint32_t)strlen(d) + 1);
     ctx->r[3] = dst;
 }
 
@@ -525,8 +529,9 @@ static void os_strncpy(PPCContext* ctx, Memory* mem) {
     uint32_t src = ctx->r[4];
     uint32_t n = ctx->r[5];
     char* d = (char*)mem->translate(dst);
-    const char* s = (const char*)mem->translate(src);
+    const char* s = (const char*)mem->read_ptr(src);
     if (d && s) strncpy(d, s, n);
+    mem->mark_written(dst, n);
     ctx->r[3] = dst;
 }
 
@@ -780,6 +785,7 @@ static void dvd_read_prio(PPCContext* ctx, Memory* mem) {
                 std::memset(dst + read, 0, length - read);
                 read = (size_t)length;
             }
+            mem->mark_written(buf_addr, length > 0 ? (uint32_t)length : 0);
             ctx->r[3] = (uint32_t)read;
         } else {
             ctx->r[3] = 0;
@@ -856,6 +862,7 @@ bool mount_disc_image(const char* iso_path, Memory* mem) {
     g_fst_ram_addr = 0x81600000;
     uint8_t* fst_dst = mem->translate(g_fst_ram_addr);
     memcpy(fst_dst, fst_data.data(), fst_size);
+    mem->mark_written(g_fst_ram_addr, (uint32_t)fst_size);
 
     // Set OS low-memory FST pointers
     mem->write32(hw::OS_FST_ADDR, g_fst_ram_addr);

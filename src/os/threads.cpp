@@ -652,6 +652,7 @@ void os_create_thread(PPCContext* ctx, Memory* mem) {
         s.threads.erase(it);
     }
     if (uint8_t* p = mem->translate(addr)) std::memset(p, 0, OSThread::SIZE);
+    mem->mark_written(addr, OSThread::SIZE);
     mem->write16(addr + thread_off::STATE, OSThread::STATE_READY);
     mem->write16(addr + thread_off::ATTR, (uint16_t)(ctx->r[9] & thread_off::ATTR_DETACH));
     mem->write32(addr + thread_off::SUSPEND_COUNT, 1);  // created suspended
@@ -839,6 +840,7 @@ void os_init_thread_queue(PPCContext* ctx, Memory* mem) {
 
 void os_init_mutex(PPCContext* ctx, Memory* mem) {
     if (uint8_t* p = mem->translate(ctx->r[3])) std::memset(p, 0, OSMutex::SIZE);
+    mem->mark_written(ctx->r[3], OSMutex::SIZE);
 }
 
 void os_lock_mutex(PPCContext* ctx, Memory* mem) {
@@ -904,6 +906,7 @@ constexpr uint32_t kMessageBlock = 1;  // OS_MESSAGE_BLOCK
 void os_init_message_queue(PPCContext* ctx, Memory* mem) {
     uint32_t q = ctx->r[3];
     if (uint8_t* p = mem->translate(q)) std::memset(p, 0, OSMessageQueue::SIZE);
+    mem->mark_written(q, OSMessageQueue::SIZE);
     mem->write32(q + mq_off::MSG_ARRAY, ctx->r[4]);
     mem->write32(q + mq_off::MSG_COUNT, ctx->r[5]);
 }
@@ -982,6 +985,7 @@ void arm_alarm(Memory* mem, uint32_t alarm, uint64_t fire, uint64_t period, uint
 
 void os_create_alarm(PPCContext* ctx, Memory* mem) {
     if (uint8_t* p = mem->translate(ctx->r[3])) std::memset(p, 0, OSAlarm::SIZE);
+    mem->mark_written(ctx->r[3], OSAlarm::SIZE);
 }
 
 // OSSetAlarm(alarm, tick, handler): `tick` (r4:r5) is relative to now.

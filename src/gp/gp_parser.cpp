@@ -338,7 +338,7 @@ private:
 
     void call_display_list(uint32_t addr, uint32_t size) {
         if (dl_depth_ >= 4) return;
-        const uint8_t* mem = g_mem.translate(addr);
+        const uint8_t* mem = g_mem.read_ptr(addr);
         ++dl_depth_;
         size_t pos = 0;
         while (pos < size) {
@@ -353,7 +353,7 @@ private:
         // which: 0 = A (position matrices), 1 = B (normal matrices), 2 = C (post matrices), 3 = D (lights)
         const uint32_t index = header >> 16, len = ((header >> 12) & 0xF) + 1, addr = header & 0xFFF;
         const uint32_t base = g_state.array_base[12 + which], stride = g_state.array_stride[12 + which];
-        const uint8_t* src = g_mem.translate(base + index * stride);
+        const uint8_t* src = g_mem.read_ptr(base + index * stride);
         for (uint32_t i = 0; i < len; ++i) {
             if (addr + i < 0x1100) g_state.xf[addr + i] = be32(src + 4 * i);
         }
@@ -409,7 +409,10 @@ private:
             const uint32_t src = (s.bp[0x64] & 0x1FFFFF) << 5;
             const uint32_t offset = (value & 0x3FF) * 512;
             const uint32_t bytes = ((value >> 10) & 0x7FF) * 32;
-            if (offset + bytes <= sizeof(s.tlut)) std::memcpy(s.tlut + offset, g_mem.translate(src), bytes);
+            if (offset + bytes <= sizeof(s.tlut)) {
+                std::memcpy(s.tlut + offset, g_mem.read_ptr(src), bytes);
+                ++s.tlut_gen;
+            }
         }
         if (reg == 0x47 || reg == 0x48) {
             // Draw-sync token: GXReadDrawSync reads it from the PE register at 0xCC00100E.
@@ -537,7 +540,7 @@ private:
                     index = be16(p);
                     p += 2;
                 }
-                return g_mem.translate(s.array_base[array] + index * s.array_stride[array]);
+                return g_mem.read_ptr(s.array_base[array] + index * s.array_stride[array]);
             };
 
             float pos[3] = {0, 0, 0};
@@ -716,6 +719,7 @@ void wgp_write(uint32_t size, uint64_t value) {
     uint32_t phys = wr & 0x03FFFFFF;
     uint8_t* dst = g_mem.translate(0x80000000u | phys);
     std::memcpy(dst, bytes, size);
+    g_mem.mark_written(0x80000000u | phys, uint32_t(size));
     phys += size;
     uint32_t wrap = wr & 0x04000000;
     if (phys > end) {  // `end` is the address of the last byte of the FIFO

@@ -298,7 +298,11 @@ void DspInterface::aram_dma(uint8_t* ram, size_t ram_size) {
     if (n > aram_.size() - aram_addr) n = aram_.size() - aram_addr;
     n = main_addr >= ram_size ? 0 : (n < ram_size - main_addr ? n : ram_size - main_addr);
     if (ram && n) {
-        if (to_main) std::memcpy(ram + main_addr, &aram_[aram_addr], n);
+        if (to_main) {
+            std::memcpy(ram + main_addr, &aram_[aram_addr], n);
+            ram_write_off = main_addr;
+            ram_write_len = uint32_t(n);
+        }
         else std::memcpy(&aram_[aram_addr], ram + main_addr, n);
     }
     // __OSInitAudioSystem hands its init code to the DSP through the ARAM DMA registers: 0x20 bytes to ARAM 0.

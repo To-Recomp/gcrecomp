@@ -29,5 +29,5 @@ decodes it. The byte order of RG8, GB8, Z16 and Z16L and the Z24X8 alpha byte (0
 conventions but are not verified against hardware.
 
 Texture copies read the EFB back from the GPU on every copy. The texture cache is keyed on a hash of the guest
-bytes, so entries overlapping the destination are re-decoded on next use without explicit invalidation. A
+bytes (kept while the write stamps of `Memory` say the pages were not stored to; the copy stamps its destination), so entries overlapping the destination are re-decoded on next use. A
 destination outside RAM is ignored with a message on stderr. Texture copies do not present a frame.

@@ -31,6 +31,8 @@
 #include "gcrecomp/hw/dsp.h"
 #include "gcrecomp/threads.h"
 #include "gcrecomp/vi.h"
+#include <algorithm>
+#include <utility>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -109,8 +111,10 @@ bool Memory::init(uint32_t size) {
     ram_size = size;
     ram_end = MAIN_RAM_BASE + ram_size;
 
+    free(page_stamp);
+    page_stamp = (uint32_t*)calloc((ram_size >> PAGE_SHIFT) + 1, sizeof(uint32_t));
     ram = (uint8_t*)calloc(1, ram_size);
-    if (!ram) {
+    if (!ram || !page_stamp) {
         fprintf(stderr, "[Memory] Failed to allocate %u MB\n", ram_size / (1024 * 1024));
         return false;
     }
@@ -124,9 +128,36 @@ void Memory::shutdown() {
         free(ram);
         ram = nullptr;
     }
+    free(page_stamp);
+    page_stamp = nullptr;
 }
 
-uint8_t* Memory::translate(uint32_t addr) {
+// Maps a guest address of RAM (cached, uncached or physical) to its offset; false when it is not RAM.
+static bool ram_offset(const Memory& m, uint32_t addr, uint32_t& off) {
+    if (addr >= Memory::MAIN_RAM_BASE && addr < m.ram_end) off = addr - Memory::MAIN_RAM_BASE;
+    else if (addr >= Memory::UNCACHED_BASE && addr - Memory::UNCACHED_BASE < m.ram_size) off = addr - Memory::UNCACHED_BASE;
+    else if (addr < m.ram_size) off = addr;
+    else return false;
+    return true;
+}
+
+void Memory::mark_written(uint32_t addr, uint32_t len) {
+    uint32_t off;
+    if (len == 0 || !page_stamp || !ram_offset(*this, addr, off)) return;
+    const uint32_t last = std::min<uint64_t>(uint64_t(off) + len - 1, ram_size - 1);
+    for (uint32_t pg = off >> PAGE_SHIFT; pg <= last >> PAGE_SHIFT; ++pg) page_stamp[pg] = write_clock;
+}
+
+bool Memory::written_since(uint32_t addr, uint32_t len, uint32_t clock) const {
+    uint32_t off;
+    if (len == 0) return false;
+    if (!page_stamp || !ram_offset(*this, addr, off) || uint64_t(off) + len > ram_size) return true;
+    for (uint32_t pg = off >> PAGE_SHIFT; pg <= (off + len - 1) >> PAGE_SHIFT; ++pg)
+        if (page_stamp[pg] >= clock) return true;
+    return false;
+}
+
+uint8_t* Memory::translate_impl(uint32_t addr) {
     // Heartbeat: prove the recompiled CPU is making forward progress.
     // Fires every 16M memory ops (~once per second for typical code).
     uint64_t& op_count = bench::g_mem_ops;
@@ -169,8 +200,14 @@ uint8_t* Memory::translate(uint32_t addr) {
     return ram; // Don't crash, return base (will produce wrong results but won't segfault)
 }
 
+uint8_t* Memory::translate(uint32_t addr) {
+    uint8_t* p = translate_impl(addr);
+    mark_host(p);
+    return p;
+}
+
 const uint8_t* Memory::translate(uint32_t addr) const {
-    return const_cast<Memory*>(this)->translate(addr);
+    return const_cast<Memory*>(this)->translate_impl(addr);
 }
 
 // The beam position registers (VI_VERT_COUNT / VI_HORIZ_COUNT) follow the retrace clock; refreshed when read.
@@ -378,6 +415,7 @@ void Memory::write16(uint32_t addr, uint16_t val) {
     }
     if (is_dsp_reg(addr)) {
         g_dsp.write(addr - DspInterface::kBase, val, 2, ram, ram_size);
+        if (g_dsp.ram_write_len) mark_written(g_dsp.ram_write_off, std::exchange(g_dsp.ram_write_len, 0));
         return;
     }
     if (addr >= HW_REG_BASE && addr < HW_REG_BASE + HW_REG_SIZE) {
@@ -385,6 +423,7 @@ void Memory::write16(uint32_t addr, uint16_t val) {
         return;
     }
     uint8_t* p = translate(addr);
+    if ((addr & 0xFFF) == 0xFFF) mark_host(p + 1);  // straddles a page
     p[0] = (uint8_t)(val >> 8);
     p[1] = (uint8_t)val;
 }
@@ -397,6 +436,7 @@ void Memory::write32(uint32_t addr, uint32_t val) {
     }
     if (is_dsp_reg(addr)) {
         g_dsp.write(addr - DspInterface::kBase, val, 4, ram, ram_size);
+        if (g_dsp.ram_write_len) mark_written(g_dsp.ram_write_off, std::exchange(g_dsp.ram_write_len, 0));
         return;
     }
     // Intercept HW register writes for HLE
@@ -405,6 +445,7 @@ void Memory::write32(uint32_t addr, uint32_t val) {
         return;
     }
     uint8_t* p = translate(addr);
+    if ((addr & 0xFFF) > 0xFFC) mark_host(p + 3);  // straddles a page
     p[0] = (uint8_t)(val >> 24);
     p[1] = (uint8_t)(val >> 16);
     p[2] = (uint8_t)(val >> 8);
