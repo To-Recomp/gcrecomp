@@ -123,26 +123,41 @@ float light_factor(const uint32_t* xf, uint32_t light, uint32_t ctrl, const floa
     return attn * (diffuse == kDiffClamp ? std::max(0.0f, n_dot_l) : n_dot_l);
 }
 
+// The light intensities computed for one vertex, shared by the four channel controls (color and alpha of both
+// channels): a light's factor depends only on the diffuse function and attenuation bits of the control (7-10) and on
+// the vertex, and games set the same bits on all of them.
+struct FactorCache {
+    uint8_t key[8];   // (ctrl >> 7) & 0xF of the control the factor was computed for
+    bool valid[8] = {};
+    float factor[8];
+};
+
 // Lights one channel's RGB (3 floats out, color control) or alpha (1 float out, alpha control).
 void light_component(const uint32_t* xf, uint32_t channel, bool alpha, const float vertex_color[4], const float pos[3],
-                     const float normal[3], float* out_rgb_or_alpha) {
+                     const float normal[3], FactorCache& cache, float* out_rgb_or_alpha) {
     const uint32_t ctrl = xf[(alpha ? kXfAlphaCtrl0 : kXfColorCtrl0) + channel];
     float material[4], ambient[4];
-    unpack_rgba8(xf[kXfMaterial0 + channel], material);
-    unpack_rgba8(xf[kXfAmbient0 + channel], ambient);
+    if (!(ctrl & 1)) unpack_rgba8(xf[kXfMaterial0 + channel], material);
     const float* mat = (ctrl & 1) ? vertex_color : material;
     const int first = alpha ? 3 : 0, count = alpha ? 1 : 3;
     if (!((ctrl >> 1) & 1)) {
         for (int i = 0; i < count; ++i) out_rgb_or_alpha[i] = mat[first + i];
         return;
     }
+    if (!((ctrl >> 6) & 1)) unpack_rgba8(xf[kXfAmbient0 + channel], ambient);
     const float* amb = ((ctrl >> 6) & 1) ? vertex_color : ambient;
     float sum[3] = {};
     for (int i = 0; i < count; ++i) sum[i] = amb[first + i];
     const uint32_t mask = ((ctrl >> 2) & 0xF) | (((ctrl >> 11) & 0xF) << 4);
+    const uint8_t fkey = uint8_t((ctrl >> 7) & 0xF);
     for (uint32_t l = 0; l < 8; ++l) {
         if (!((mask >> l) & 1)) continue;
-        const float f = light_factor(xf, l, ctrl, pos, normal);
+        if (!cache.valid[l] || cache.key[l] != fkey) {
+            cache.factor[l] = light_factor(xf, l, ctrl, pos, normal);
+            cache.key[l] = fkey;
+            cache.valid[l] = true;
+        }
+        const float f = cache.factor[l];
         float color[4];
         unpack_rgba8(xf[kXfLights + l * 16 + 3], color);
         for (int i = 0; i < count; ++i) sum[i] += color[first + i] * f;
@@ -154,9 +169,10 @@ void light_component(const uint32_t* xf, uint32_t channel, bool alpha, const flo
 
 void light_vertex(const uint32_t* xf, const float vertex_color[2][4], const float view_pos[3], const float normal[3],
                   float out[2][4]) {
+    FactorCache cache;
     for (uint32_t c = 0; c < 2; ++c) {
-        light_component(xf, c, false, vertex_color[c], view_pos, normal, out[c]);
-        light_component(xf, c, true, vertex_color[c], view_pos, normal, out[c] + 3);
+        light_component(xf, c, false, vertex_color[c], view_pos, normal, cache, out[c]);
+        light_component(xf, c, true, vertex_color[c], view_pos, normal, cache, out[c] + 3);
     }
 }
 
