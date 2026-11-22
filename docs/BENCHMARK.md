@@ -86,13 +86,13 @@ so single seconds are noisy; means over the segment.
 | --- | --- | --- | --- | --- | --- |
 | baseline (generated code -O1) | 34 | 58.7 (min 16) | 60 | **12.8** (min 8) | 111% |
 | renderer: GL state/uniform/binding caches, texture validation by page write stamps (#41) | 59.9 | 59.3 | 59.9 | **30** (60 in quiet seconds) | 74% |
-| vertex ring buffer, parser waits for the bytes it needs, faster EFB encode (#42) | 60 | 59.5 | 59.9 | **52.5** (min 31) | 57% of a core |
-| inline memory fast path (#43) | 60 | 59.7 | 59.9 | **59.7** (min 57) | 71% (74% main thread) |
-| lighting, no per-command getenv (#44) | 59.9 | 60 | 59.9 | 57.7 to 59.4 (min 44 to 48) | 74% |
+| vertex ring buffer, parser waits for the bytes it needs, faster EFB encode (#42) | 60 | 59.5 | 59.9 | **52.5** (min 31) | 74% |
+| inline memory fast path (#43) | 60 | 59.7 | 59.9 | **59.7** (min 57) | 71% |
+| lighting, no per-command getenv (#44) | 59.9 | 60 | 57.5 to 59.9 | 57.7 to 59.4 (min 44 to 48) | 74% |
 
 Time to the opening classroom with player control (`tos-new-game.txt` + `tos-classroom.txt`, wall clock from the start of the
-run): about 265 s, against about 790 s before (the cutscene is paced by game frames, which now complete at 60 per second:
-`GAMEPLAY_FINDINGS.md` recorded about 600 s for the cutscene alone). The picture of the classroom with control looks as it
+run): about 265 s (control at retrace frame 15 650). `GAMEPLAY_FINDINGS.md` recorded about 600 s for the cutscene alone after the
+190 s of `tos-new-game.txt` (not re-measured here): the cutscene is paced by game frames, which now complete at 60 per second. The picture of the classroom with control looks as it
 should and `[gp]` reports 0 unknown commands.
 
 What was wrong: the classroom submits ~10 000 draws per frame. The renderer hashed the whole guest texture of every map on
@@ -102,7 +102,7 @@ classroom; the intro movie (guest-code bound) needs 21 to 28% of a core.
 
 What remains (classroom profile, main thread at ~75% of a core): vertex decode, transform and lighting in `Parser::draw` and
 `light_vertex` (~35%), `apply_state` and the GL driver's command thread (~10%), the EFB copy read-back and encode (~4%, plus
-the GPU stall of `glReadPixels`), `Memory` accessors called from the recompiled code (~11% at -O1; 1.5% with
+the GPU stall of `glReadPixels`), `Memory` accessors called from the recompiled code (~11% at -O1; in the movie 27% become 1.5% with
 `GCRECOMP_FORCE_INLINE_MEMORY`), `memmove` of the parser's input buffer and of expanded quads (~4%). Not done: keeping EFB
 copies on the GPU when the CPU never reads them back (needs the format quantisation emulated in a shader), a 144-byte vertex
 with eight texture coordinate sets (a leaner vertex format would cut the upload), indexed quads instead of expanding them, the
