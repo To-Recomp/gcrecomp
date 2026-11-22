@@ -42,7 +42,7 @@ unsigned AudioInterface::poll() {
     if (in_poll_) return 0;
     in_poll_ = true;
     unsigned started = 0;
-    const auto now = std::chrono::steady_clock::now();
+    const auto now = clock_();
     if (enabled_) {
         if (last_poll_ != std::chrono::steady_clock::time_point{}) {
             const double gap = std::chrono::duration<double, std::milli>(now - last_poll_).count();

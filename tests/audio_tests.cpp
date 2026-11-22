@@ -293,12 +293,14 @@ static void test_stuck_sink_does_not_stop_the_dma() {
     Harness h;
     h.fill(0x1000, 160, 7);
     h.ai.init_dma(0x1000, 640);
+    auto fake_now = std::chrono::steady_clock::time_point{} + std::chrono::seconds(1000);
+    h.ai.set_clock([&] { return fake_now; });
     h.ai.set_stall_ms(30);
     h.ai.start_dma();
     CHECK(h.ai.poll() == 4);  // the lead is full and the sink never consumes
     CHECK(h.ai.poll() == 0);
     CHECK(!h.ai.stalled());
-    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    fake_now += std::chrono::milliseconds(40);
     h.ai.poll();
     CHECK(h.ai.stalled());
     CHECK(h.ai.stats().stalls == 1);
@@ -307,10 +309,10 @@ static void test_stuck_sink_does_not_stop_the_dma() {
     // 100 ms of host time later the DMA has gone on by about that much (20 ms lead: it refills 20 ms per poll)
     unsigned started = 0;
     for (int i = 0; i < 10; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        fake_now += std::chrono::milliseconds(10);
         started += h.ai.poll();
     }
-    CHECK(started >= 15 && started <= 30);  // 100 ms = 20 blocks of 5 ms, give or take scheduling
+    CHECK(started == 20);  // 100 ms of simulated time = 20 blocks of 5 ms
     CHECK(h.ai.stats().blocks == blocks + started);
     CHECK(h.sink.recorded().size() == recorded);  // nothing went to the stuck sink
     CHECK(h.ai.stats().stalled_frames >= uint64_t(started) * 160);

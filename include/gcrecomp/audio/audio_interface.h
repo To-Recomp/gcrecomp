@@ -78,6 +78,9 @@ public:
     bool stalled() const { return stalled_; }
     /// How long a full sink may go without draining before it counts as stalled. Default 250 ms.
     void set_stall_ms(uint32_t ms) { stall_ms_ = ms; }
+    /// Time source for the stall detection and the host-clock fallback (default: steady_clock); tests inject a simulated one.
+    using ClockFn = std::function<std::chrono::steady_clock::time_point()>;
+    void set_clock(ClockFn clock) { clock_ = std::move(clock); }
     /// Resets the maximum-gap counter (the others only grow).
     void reset_max_gap() { stats_.max_poll_gap_ms = 0; }
 
@@ -93,6 +96,7 @@ private:
     bool in_poll_ = false;
     uint64_t blocks_ = 0;
     Stats stats_;
+    ClockFn clock_ = [] { return std::chrono::steady_clock::now(); };
     uint32_t stall_ms_ = 250;
     bool stalled_ = false;
     size_t last_queued_ = 0;
