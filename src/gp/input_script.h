@@ -35,12 +35,14 @@ struct Observation {
     std::vector<std::string> files;         // disc files opened since the previous step, in order
 };
 
-enum class CmdKind { At, Press, Wait, WaitSeconds, WaitPresented, WaitFile, WaitChange, WaitStill, Shot };
+enum class CmdKind { At, Press, Wait, WaitSeconds, WaitPresented, WaitFile, WaitChange, WaitStill, Shot, PressUntilFile, TraceFrame };
 
 struct Command {
     CmdKind kind = CmdKind::Wait;
     uint16_t mask = 0;       // Press: PAD_BUTTON_* bits
+    std::vector<uint16_t> cycle;  // PressUntilFile: the presses, used in turn
     int count = 0;           // At: frame; Press: hold frames; Wait*/WaitStill: how many
+    int every = 120;         // PressUntilFile: frames between presses
     double seconds = 0;      // WaitSeconds: duration
     double threshold = 0.05; // WaitChange / WaitStill: signature difference that counts as a change
     double timeout = 0;      // seconds of wall time after which a wait gives up (0 = never)
@@ -61,6 +63,8 @@ public:
     bool finished() const { return pc_ >= cmds_.size(); }
     // True while the current wait compares pictures (the host then reads the frame back).
     bool needs_signature() const;
+    // Frames to trace (GP_TRACE_FRAME style) requested since the last call, as "the Nth next frame".
+    std::vector<int> take_traces();
     // Screenshot names requested since the last call.
     std::vector<std::string> take_shots();
     // One line per command that started a wait or ran, for the host's log (drained by the caller).
@@ -80,9 +84,12 @@ private:
     FrameSignature ref_;
     uint64_t last_sig_presented_ = 0;
     int still_count_ = 0;
+    int next_press_ = 0;
+    size_t cycle_pos_ = 0;
     size_t file_cursor_ = 0;  // index in the current Observation::files not yet consumed
     std::vector<Hold> holds_;
     std::vector<std::string> shots_, log_;
+    std::vector<int> traces_;
 };
 
 }  // namespace gcrecomp::gp::input

@@ -11,7 +11,7 @@ TOS_SCRIPT=@script.txt ./your_boot ...             # the script is read from the
 ```
 
 The host program has to call `gp::pump_events()` once per frame, as the boot harnesses do. Everything the
-script does is logged on stderr as `[script] frame N: <command>`; a wait that gives up logs `timed out`.
+script does is logged on stderr as `[script] frame N: <command>`, and so is every disc file the game opens (`[script] frame N: game opened PATH`), which gives a timeline to write the script against; a wait that gives up logs `timed out`.
 
 ## Format
 
@@ -27,8 +27,10 @@ condition holds, `press` does not block (the button is held while later commands
 | `wait-seconds S` | Waits `S` seconds of wall time. |
 | `wait-presented N` | Waits until `N` more frames have been presented to the window. |
 | `wait-file TEXT` | Waits until the game opens (DVDOpen / DVDFastOpen) a disc file whose path contains `TEXT`, ignoring case. Only opens after the wait began count; `TEXT` has no blanks. |
+| `press-until-file TEXT BTN[+BTN...]... [every=N] [hold=N]` | Every `N` frames (default 120) presses the next of the listed buttons (held `hold` frames, default 10), in turn, until the game opens a matching file: for a menu that ignores a press made before it is ready, or a dialog that may or may not show (`D A` picks the second entry). |
 | `wait-change [T]` | Waits until the picture differs from the one on screen when the wait began by more than `T` (default 0.05). |
 | `wait-still N [T]` | Waits until `N` consecutive presented frames each differ from the previous one by at most `T` (default 0.05): the screen has settled. |
+| `trace-frame [N]` | Traces the draws of the `N`th next presented frame (default 1, the frame in progress) as `GP_TRACE_FRAME` does (see DEBUGGING.md), so a frame reached by events can be inspected without knowing its number. |
 | `shot NAME` | Writes the next presented frame as `NAME.ppm` in the screenshot directory (`TOS_SCREENSHOT_DIR` of the harness). |
 
 Every wait accepts `timeout=SECONDS` (wall time), after which it is considered done, so one missed event

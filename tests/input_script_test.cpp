@@ -116,6 +116,30 @@ static void test_wait_file() {
     CHECK(early.tick() == 0 && early.tick() == 0 && early.tick() == 0);
 }
 
+static void test_press_until_file() {
+    Host h("press-until-file next.bin A every=20 hold=3; press B hold=1");
+    int presses = 0;
+    uint16_t prev = 0;
+    for (int i = 0; i < 70; ++i) {
+        const uint16_t b = h.tick();
+        CHECK((b & ~kA) == 0);
+        if ((b & kA) && !(prev & kA)) ++presses;
+        prev = b;
+    }
+    CHECK(presses == 4);  // frames 1, 21, 41, 61
+    h.pending_files = {"s/NEXT.bin"};
+    CHECK(h.tick() == kB);  // the file ends the loop and the next command runs at once
+    CHECK(h.tick() == 0);
+    Host seq("press-until-file n.bin D A+B every=10 hold=2");
+    uint16_t at[40];
+    for (auto& v : at) v = seq.tick();
+    CHECK(at[0] == kDown && at[1] == kDown && at[2] == 0);
+    CHECK(at[10] == (kA | kB) && at[20] == kDown && at[30] == (kA | kB));  // the buttons are used in turn
+    Script s;
+    std::string e;
+    CHECK(!s.parse("press-until-file x", e) && !s.parse("press-until-file x Q", e) && !s.parse("press-until-file x A every=0", e));
+}
+
 static void test_wait_presented() {
     Host h("wait-presented 3; press A");
     CHECK(h.tick(false) == 0 && h.tick(false) == 0);
@@ -180,6 +204,17 @@ static void test_shot() {
     CHECK(h.script.take_shots().empty());
 }
 
+static void test_trace_frame() {
+    Host h("trace-frame; wait 1; trace-frame 3");
+    h.tick();
+    CHECK(h.script.take_traces() == std::vector<int>{1});
+    h.tick();
+    CHECK(h.script.take_traces() == std::vector<int>{3});
+    Script s;
+    std::string e;
+    CHECK(!s.parse("trace-frame x", e) && !s.parse("trace-frame 1 2", e));
+}
+
 static void test_log() {
     Host h("press A; wait 1");
     h.tick();
@@ -213,10 +248,12 @@ int main() {
     test_press_and_wait();
     test_at_and_seconds();
     test_wait_file();
+    test_press_until_file();
     test_wait_presented();
     test_wait_change();
     test_wait_still();
     test_shot();
+    test_trace_frame();
     test_log();
     test_signature();
     if (g_failures) std::fprintf(stderr, "%d check(s) failed\n", g_failures);

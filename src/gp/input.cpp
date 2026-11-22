@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include "input.h"
 
+#include "gcrecomp/gp/gp.h"
+
 #include <SDL3/SDL.h>
 
 #include <algorithm>
@@ -375,7 +377,9 @@ uint16_t run_script() {
     o.sig = g_signature.empty() ? nullptr : &g_signature;
     o.sig_at = g_signature_at;
     take_opened_disc_files(o.files);
+    for (const std::string& f : o.files) std::fprintf(stderr, "[script] frame %d: game opened %s\n", g_frame, f.c_str());
     const uint16_t buttons = g_script.step(o);
+    for (int n : g_script.take_traces()) request_trace_frame(uint64_t(n));
     for (const std::string& line : g_script.take_log()) std::fprintf(stderr, "[script] %s\n", line.c_str());
     return buttons;
 }

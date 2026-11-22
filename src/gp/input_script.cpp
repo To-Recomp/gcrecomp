@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "input_script.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
@@ -126,6 +127,7 @@ bool parse_command(const std::vector<std::string>& w, const std::string& src, st
         if (key == "timeout") c.timeout = v;
         else if (key == "threshold") c.threshold = v;
         else if (key == "hold") { c.count = int(v); have_hold = true; }
+        else if (key == "every") c.every = int(v);
         else return fail("unknown option '" + key + "'");
     }
     const std::string verb = lower(w[0]);
@@ -147,6 +149,24 @@ bool parse_command(const std::vector<std::string>& w, const std::string& src, st
         }
         if (!have_hold) c.count = 5;
         if (c.count < 1) return fail("hold must be at least 1 frame");
+    } else if (verb == "press-until-file") {
+        c.kind = CmdKind::PressUntilFile;
+        if (args.size() < 2) return fail("press-until-file takes a path substring and buttons, used in turn (press-until-file mov/s01 D A every=60)");
+        c.text = lower(args[0]);
+        for (size_t i = 1; i < args.size(); ++i) {
+            uint16_t mask = 0;
+            for (size_t pos = 0; pos <= args[i].size();) {
+                size_t plus = args[i].find('+', pos);
+                if (plus == std::string::npos) plus = args[i].size();
+                const uint16_t m = button_mask(args[i].substr(pos, plus - pos));
+                if (!m) return fail("unknown button in '" + args[i] + "'");
+                mask |= m;
+                pos = plus + 1;
+            }
+            c.cycle.push_back(mask);
+        }
+        if (!have_hold) c.count = 10;
+        if (c.count < 1 || c.every < 1) return fail("hold and every must be at least 1 frame");
     } else if (verb == "at") {
         c.kind = CmdKind::At;
         if (!need_args(1) || !number_arg(v)) return fail("at takes a frame number");
@@ -179,6 +199,11 @@ bool parse_command(const std::vector<std::string>& w, const std::string& src, st
         c.count = int(v);
         if (c.count < 1) return fail("wait-still needs at least 1 frame");
         if (args.size() == 2 && !parse_number(args[1], c.threshold)) return fail("bad threshold");
+    } else if (verb == "trace-frame") {
+        c.kind = CmdKind::TraceFrame;
+        c.count = 1;
+        if (args.size() > 1 || (args.size() == 1 && !number_arg(v))) return fail("trace-frame takes an optional frame offset (1 = the frame in progress)");
+        if (args.size() == 1) c.count = std::max(1, int(v));
     } else if (verb == "shot") {
         c.kind = CmdKind::Shot;
         if (!need_args(1)) return fail("shot takes a file name (written as NAME.ppm in the screenshot directory)");
@@ -238,6 +263,12 @@ std::vector<std::string> Script::take_shots() {
     return out;
 }
 
+std::vector<int> Script::take_traces() {
+    std::vector<int> out;
+    out.swap(traces_);
+    return out;
+}
+
 std::vector<std::string> Script::take_log() {
     std::vector<std::string> out;
     out.swap(log_);
@@ -258,6 +289,8 @@ uint16_t Script::step(const Observation& o) {
             if (o.sig && o.sig_at == o.presented) ref_ = *o.sig;
             last_sig_presented_ = o.sig_at;
             still_count_ = 0;
+            next_press_ = o.frame;
+            cycle_pos_ = 0;
             log_.push_back("frame " + std::to_string(o.frame) + ": " + c.source);
         }
         bool done = true;
@@ -266,6 +299,7 @@ uint16_t Script::step(const Observation& o) {
             case CmdKind::Wait: done = o.frame - start_frame_ >= c.count; break;
             case CmdKind::WaitSeconds: done = o.seconds - start_seconds_ >= c.seconds; break;
             case CmdKind::WaitPresented: done = o.presented - start_presented_ >= uint64_t(c.count); break;
+            case CmdKind::PressUntilFile:
             case CmdKind::WaitFile: {
                 done = false;
                 for (; file_cursor_ < o.files.size(); ++file_cursor_)
@@ -274,6 +308,11 @@ uint16_t Script::step(const Observation& o) {
                         done = true;
                         break;
                     }
+                if (!done && c.kind == CmdKind::PressUntilFile && o.frame >= next_press_) {
+                    holds_.push_back({c.cycle[cycle_pos_], o.frame + c.count});
+                    cycle_pos_ = (cycle_pos_ + 1) % c.cycle.size();
+                    next_press_ = o.frame + c.every;
+                }
                 break;
             }
             case CmdKind::WaitChange:
@@ -295,6 +334,7 @@ uint16_t Script::step(const Observation& o) {
                 break;
             }
             case CmdKind::Press:
+            case CmdKind::TraceFrame:
             case CmdKind::Shot: break;
         }
         if (!done && c.timeout > 0 && o.seconds - start_seconds_ >= c.timeout) {
@@ -304,6 +344,7 @@ uint16_t Script::step(const Observation& o) {
         if (!done) break;
         if (c.kind == CmdKind::Press) holds_.push_back({c.mask, o.frame + c.count});
         if (c.kind == CmdKind::Shot) shots_.push_back(c.text);
+        if (c.kind == CmdKind::TraceFrame) traces_.push_back(c.count);
         ++pc_;
         started_ = false;
     }
