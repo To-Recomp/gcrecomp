@@ -158,6 +158,7 @@ if(GCRECOMP_BUILD_RUNTIME)
         # so no libGL / opengl32 is linked.
         add_library(gcrecomp_gp STATIC
             src/gp/gp.cpp
+            src/gp/bench.cpp
             src/gp/gp_parser.cpp
             src/gp/lighting.cpp
             src/gp/gl_renderer.cpp

@@ -30,6 +30,7 @@ Switches and tools for finding out why a frame looks wrong. Nothing here needs a
 
 ## Tools
 
+* `tools/benchmark.py`: frames per second per scene, VI throttling, CPU use and a `perf` profile of a scripted run (docs/BENCHMARK.md).
 * `tools/frame_compare.py OURS REFERENCE [--out sheet.png]`: compares one of our screenshots (PPM) with a
   reference frame (for example from Dolphin) and prints the error and a luminance grid of both, so a black
   render next to a bright reference is obvious. `--max-rmse` turns it into a check.

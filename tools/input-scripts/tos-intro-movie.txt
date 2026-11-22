@@ -1,0 +1,7 @@
+# Tales of Symphonia (GQSF): from a blank card to the opening movie, which plays (nothing skips it). A benchmark script
+# (tools/benchmark.py --segment movie=mov/op.h4m): about 30 s to reach the movie, then 30 s of it. Inputs only, no game data.
+wait 200; press D; wait 20; press D; wait 20; press A
+wait 60; press U; wait 20; press A
+wait 150; press A
+wait-file mov/op.h4m timeout=60
+wait 1800

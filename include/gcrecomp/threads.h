@@ -48,6 +48,10 @@ void retrace_arm();
 // Retraces taken so far (the clock ticks; whether a handler ran depends on the guest's interrupt masks).
 uint64_t retrace_count();
 
+// Nanoseconds every guest thread spent blocked, waiting for an alarm or the retrace (the idle loop): the share of time
+// the game is throttled by the VI clock rather than running flat out. For GCRECOMP_BENCH (gcrecomp/bench.h).
+uint64_t idle_ns();
+
 // A safe point: takes the interrupts that have come due (runs the alarm handlers and the retrace handler, then
 // lets a higher-priority thread they made ready run). Cheap when nothing is due: one clock read. Does nothing
 // while the calling thread has interrupts disabled, or inside a scheduler call or interrupt handler.
