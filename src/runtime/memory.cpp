@@ -67,6 +67,9 @@ static void parse_watch(Memory& m) {
     }
 }
 
+// Any function of the executable: dladdr() on it gives the load address the call-chain offsets are relative to.
+static void watch_anchor() {}
+
 void Memory::watch_hit(uint32_t addr, uint32_t len, uint64_t value) {
     const uint32_t lo = addr & kPhysMask, hi = lo + len;
     bool hit = false;
@@ -84,7 +87,7 @@ void Memory::watch_hit(uint32_t addr, uint32_t len, uint64_t value) {
     void* frames[16];
     const int n = backtrace(frames, 16);
     Dl_info info;
-    if (n > 0 && dladdr(reinterpret_cast<void*>(&Memory::init), &info)) {
+    if (n > 0 && dladdr(reinterpret_cast<void*>(&watch_anchor), &info)) {
         std::fprintf(stderr, " bt:");
         for (int i = 1; i < n; ++i)
             std::fprintf(stderr, " %llX", (unsigned long long)((char*)frames[i] - (char*)info.dli_fbase));
