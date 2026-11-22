@@ -209,11 +209,15 @@ public:
     void feed(const uint8_t* data, size_t n) {
         buf_.insert(buf_.end(), data, data + n);
         for (size_t i = 0; i < n; ++i) raw_[raw_pos_++ & 255] = data[i];
+        // A vertex command or XF load arrives a store at a time: do not decode its layout again until the bytes
+        // the last attempt said it needs are there.
+        if (buf_.size() < want_) return;
         size_t pos = 0;
         while (pos < buf_.size()) {
             const size_t used = parse_one(buf_.data() + pos, buf_.size() - pos);
-            if (used) remember(buf_[pos], used);
             if (used == 0) break;
+            want_ = 0;
+            remember(buf_[pos], used);
             pos += used;
         }
         if (pos) buf_.erase(buf_.begin(), buf_.begin() + pos);
@@ -221,6 +225,7 @@ public:
 
 private:
     std::vector<uint8_t> buf_;
+    size_t want_ = 0;  // bytes the command at the head of buf_ needs (set by an incomplete parse_one), 0 = unknown
     std::vector<float> vertices_;
     int dl_depth_ = 0;
 
@@ -243,7 +248,10 @@ private:
                     huge_reported_ = true;
                     dump_raw("huge XF load header");
                 }
-                if (n < 5 + 4 * size_t(count)) return 0;
+                if (n < 5 + 4 * size_t(count)) {
+                    want_ = 5 + 4 * size_t(count);
+                    return 0;
+                }
                 ++g_stats.commands;
                 if (count > 64 && std::getenv("GP_TRACE")) {
                     std::fprintf(stderr, "[GP] XF load addr=0x%04X count=%u; bytes:", addr, count);
@@ -291,7 +299,10 @@ private:
             const uint32_t count = be16(p + 1);
             const Layout layout = make_layout(g_state, cmd & 7);
             const size_t total = 3 + size_t(count) * layout.size;
-            if (n < total) return 0;
+            if (n < total) {
+                want_ = total;
+                return 0;
+            }
             ++g_stats.commands;
             if (trace_draws_ < 12 && std::getenv("GP_TRACE")) {
                 ++trace_draws_;

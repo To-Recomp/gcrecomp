@@ -46,6 +46,7 @@ int g_shot_count = 0;
 GLuint g_fbo = 0, g_color = 0, g_depth = 0;
 GLuint g_vao = 0, g_vbo = 0, g_program = 0;
 GLuint g_white = 0;
+bool g_ring_valid = false;  // the vertex buffer holds the ring (an oversized draw replaced it)
 bool g_efb_bound = false;  // GL_FRAMEBUFFER is the EFB framebuffer (draw() binds it lazily; EFB copies unbind it)
 uint64_t g_indirect_draws = 0;
 // How often the game used the features that are only visible on screen, reported at shutdown.
@@ -923,7 +924,34 @@ void draw(const DrawCall& call, const State& s) {
         default: return;
     }
     if (count == 0) return;
-    glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(size_t(count) * kVertexFloats * sizeof(float)), data, GL_STREAM_DRAW);
+    // Vertices go to the next free part of one big buffer (glBufferData per draw allocated a new buffer each time);
+    // when it is full the buffer is orphaned and filling starts over.
+    constexpr size_t kVertexBytes = kVertexFloats * sizeof(float);
+    constexpr size_t kRingBytes = (16u << 20) / kVertexBytes * kVertexBytes;  // a whole number of vertices
+    static size_t ring_used = 0;
+    const size_t bytes = size_t(count) * kVertexBytes;
+    GLint first = 0;
+    if (bytes > kRingBytes) {
+        glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(bytes), data, GL_STREAM_DRAW);
+        g_ring_valid = false;
+    } else {
+        if (!g_ring_valid || ring_used + bytes > kRingBytes) {
+            glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(kRingBytes), nullptr, GL_STREAM_DRAW);
+            g_ring_valid = true;
+            ring_used = 0;
+        }
+        // Unsynchronized: the range written is never one a queued draw still reads (the ring only moves forward).
+        void* dst = glMapBufferRange(GL_ARRAY_BUFFER, GLsizeiptr(ring_used), GLsizeiptr(bytes),
+                                     GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+        if (dst) {
+            std::memcpy(dst, data, bytes);
+            glUnmapBuffer(GL_ARRAY_BUFFER);
+        } else {
+            glBufferSubData(GL_ARRAY_BUFFER, GLsizeiptr(ring_used), GLsizeiptr(bytes), data);
+        }
+        first = GLint(ring_used / kVertexBytes);
+        ring_used += bytes;
+    }
     static const bool xhist = std::getenv("GP_XHIST") != nullptr;
     if (xhist) {
         static float minx = 1e9f, maxx = -1e9f, miny = 1e9f, maxy = -1e9f;
@@ -939,7 +967,7 @@ void draw(const DrawCall& call, const State& s) {
             frame_draws = 0; minx = miny = 1e9f; maxx = maxy = -1e9f;
         }
     }
-    glDrawArrays(mode, 0, GLsizei(count));
+    glDrawArrays(mode, first, GLsizei(count));
     if (early_z_writes_rejected_pixels(s.bp)) {
         // Z compare before texturing: pixels the alpha test rejected still update depth. Replay the
         // draw without color and without the alpha test; pixels that passed already wrote their depth
@@ -950,7 +978,7 @@ void draw(const DrawCall& call, const State& s) {
         glUniform2ui(g_loc.alpha_cmp, 7u | (7u << 3), 0u);
         g_sh.color_mask = -1;  // the next apply_state restores both
         g_sh.alpha_cmp.valid = false;
-        glDrawArrays(mode, 0, GLsizei(count));
+        glDrawArrays(mode, first, GLsizei(count));
     }
 }
 
@@ -971,13 +999,15 @@ static void copy_efb_to_memory(const State& s, uint32_t copy_cmd) {
     glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     const int gl_y = kEfbHeight - (p.y + p.h);
-    std::vector<uint8_t> rgba(size_t(p.w) * p.h * 4);
-    std::vector<uint32_t> depth;
+    // Read-back buffers kept between copies (a frame makes several): no allocation and no zero fill per copy.
+    static std::vector<uint8_t> rgba;
+    static std::vector<uint32_t> depth;
     if (p.depth) {
         depth.resize(size_t(p.w) * p.h);
         glReadPixels(p.x, gl_y, p.w, p.h, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, depth.data());
         for (uint32_t& d : depth) d >>= 8;
     } else {
+        rgba.resize(size_t(p.w) * p.h * 4);
         glReadPixels(p.x, gl_y, p.w, p.h, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
     }
     // GL rows run bottom to top.
@@ -986,7 +1016,7 @@ static void copy_efb_to_memory(const State& s, uint32_t copy_cmd) {
             std::swap_ranges(v.begin() + a * row_elems, v.begin() + (a + 1) * row_elems, v.begin() + b * row_elems);
     };
     if (p.depth) flip(depth, size_t(p.w)); else flip(rgba, size_t(p.w) * 4);
-    encode_efb_copy(p, rgba.data(), p.depth ? depth.data() : nullptr, g_mem.translate(addr));
+    encode_efb_copy(p, p.depth ? nullptr : rgba.data(), p.depth ? depth.data() : nullptr, g_mem.translate(addr));
     g_mem.mark_written(addr | Memory::MAIN_RAM_BASE, uint32_t(efb_copy_extent(p)));  // the cached textures made from this memory are stale
 }
 

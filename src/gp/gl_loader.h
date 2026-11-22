@@ -28,6 +28,9 @@ typedef unsigned int GLuint;
 
 #define GL_ALWAYS 0x0207
 #define GL_ARRAY_BUFFER 0x8892
+#define GL_MAP_WRITE_BIT 0x0002
+#define GL_MAP_INVALIDATE_RANGE_BIT 0x0004
+#define GL_MAP_UNSYNCHRONIZED_BIT 0x0020
 #define GL_BACK 0x0405
 #define GL_BLEND 0x0BE2
 #define GL_CLAMP_TO_EDGE 0x812F
@@ -128,6 +131,9 @@ typedef unsigned int GLuint;
     X(void, glBlendFuncSeparate, (GLenum sfactorRGB, GLenum dfactorRGB, GLenum sfactorAlpha, GLenum dfactorAlpha)) \
     X(void, glBlitFramebuffer, (GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter)) \
     X(void, glBufferData, (GLenum target, GLsizeiptr size, const void *data, GLenum usage)) \
+    X(void, glBufferSubData, (GLenum target, GLsizeiptr offset, GLsizeiptr size, const void *data)) \
+    X(void*, glMapBufferRange, (GLenum target, GLsizeiptr offset, GLsizeiptr length, GLbitfield access)) \
+    X(GLboolean, glUnmapBuffer, (GLenum target)) \
     X(GLenum, glCheckFramebufferStatus, (GLenum target)) \
     X(void, glClear, (GLbitfield mask)) \
     X(void, glClearColor, (GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha)) \
