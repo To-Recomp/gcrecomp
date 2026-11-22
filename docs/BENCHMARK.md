@@ -75,3 +75,35 @@ Intro movie (guest-code bound: 60 fps either way, the number is the CPU needed f
 sites of the game; it pays only for guest-heavy scenes (the classroom is bound by the GP, not by guest code), at 2.4 times the
 compile time and twice the binary. `-fno-plt` / `-fno-semantic-interposition` do nothing here: the recompiled functions call each
 other directly inside one executable.
+
+## Results of the speed work (Tales of Symphonia, PAL French; 16-core desktop with an AMD GPU, nice 19)
+
+`tools/benchmark.py ... tos-new-game.txt` (the opening is wall-clock driven: the game logic runs per retrace, so "fps" is the
+rate at which the game finishes frames; 60 is full speed). The host was shared with a desktop session (load average 2 to 8),
+so single seconds are noisy; means over the segment.
+
+| change (PR) | title | new-game screens | 64 s movie | classroom (field) | classroom CPU |
+| --- | --- | --- | --- | --- | --- |
+| baseline (generated code -O1) | 34 | 58.7 (min 16) | 60 | **12.8** (min 8) | 111% |
+| renderer: GL state/uniform/binding caches, texture validation by page write stamps (#41) | 59.9 | 59.3 | 59.9 | **30** (60 in quiet seconds) | 74% |
+| vertex ring buffer, parser waits for the bytes it needs, faster EFB encode (#42) | 60 | 59.5 | 59.9 | **52.5** (min 31) | 57% of a core |
+| inline memory fast path (#43) | 60 | 59.7 | 59.9 | **59.7** (min 57) | 71% (74% main thread) |
+| lighting, no per-command getenv (#44) | 59.9 | 60 | 59.9 | 57.7 to 59.4 (min 44 to 48) | 74% |
+
+Time to the opening classroom with player control (`tos-new-game.txt` + `tos-classroom.txt`, wall clock from the start of the
+run): about 265 s, against about 790 s before (the cutscene is paced by game frames, which now complete at 60 per second:
+`GAMEPLAY_FINDINGS.md` recorded about 600 s for the cutscene alone). The picture of the classroom with control looks as it
+should and `[gp]` reports 0 unknown commands.
+
+What was wrong: the classroom submits ~10 000 draws per frame. The renderer hashed the whole guest texture of every map on
+every draw (55% of the time), looked uniforms up by name and re-sent unchanged state, allocated a GL buffer per draw, and the
+parser decoded the vertex layout again after every 4-byte store of a vertex command. Recompiled guest code is 5% of the
+classroom; the intro movie (guest-code bound) needs 21 to 28% of a core.
+
+What remains (classroom profile, main thread at ~75% of a core): vertex decode, transform and lighting in `Parser::draw` and
+`light_vertex` (~35%), `apply_state` and the GL driver's command thread (~10%), the EFB copy read-back and encode (~4%, plus
+the GPU stall of `glReadPixels`), `Memory` accessors called from the recompiled code (~11% at -O1; 1.5% with
+`GCRECOMP_FORCE_INLINE_MEMORY`), `memmove` of the parser's input buffer and of expanded quads (~4%). Not done: keeping EFB
+copies on the GPU when the CPU never reads them back (needs the format quantisation emulated in a shader), a 144-byte vertex
+with eight texture coordinate sets (a leaner vertex format would cut the upload), indexed quads instead of expanding them, the
+recompiler polling at loop back-edges instead of counting every memory operation.
