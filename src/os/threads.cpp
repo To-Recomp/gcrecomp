@@ -97,6 +97,7 @@ thread_local int t_busy = 0;
 // the lock by poll(). Updated by update_deadline() whenever alarms or the retrace source change.
 constexpr int64_t kNoDeadline = INT64_MAX;
 std::atomic<int64_t> g_deadline{kNoDeadline};
+std::atomic<uint64_t> g_idle_ns{0};  // time spent in idle_wait (idle_ns())
 
 int64_t now_ns() { return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count(); }
 int64_t to_ns(Clock::time_point t) { return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count(); }
@@ -314,7 +315,10 @@ void idle_wait(Lock& lk, GThread* self) {
     } else {
         until = Clock::time_point(std::chrono::duration_cast<Clock::duration>(std::chrono::nanoseconds(d)));
     }
+    const auto idle_start = Clock::now();
     self->cv.wait_until(lk, until, [&] { return self->killed; });
+    g_idle_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - idle_start).count(),
+                        std::memory_order_relaxed);
     if (self->killed) throw Killed{};
 }
 
@@ -579,6 +583,7 @@ void retrace_arm() {
 }
 
 uint64_t retrace_count() { return vi::retrace_timer().count(); }
+uint64_t idle_ns() { return g_idle_ns.load(std::memory_order_relaxed); }
 
 void poll(PPCContext* ctx, Memory* mem) {
     // The decrementer and the VI retrace are timers that interrupt whatever runs. Interrupts cannot preempt

@@ -4,6 +4,8 @@
 // gp_parser.cpp, which has no dependency on SDL or OpenGL.
 #include "gcrecomp/gp/gp.h"
 
+#include "gcrecomp/bench.h"
+
 #include "gp_internal.h"
 #include "gcrecomp/runtime.h"
 #include "input.h"
@@ -15,6 +17,7 @@ bool init(const Config& config) {
     g_graphics = renderer::init(config.window_width, config.window_height, config.screenshot_dir, config.max_screenshots);
     g_wgp_write = &wgp_write;
     if (g_graphics) input::init(config.input_config);
+    bench::start();
     return g_graphics;
 }
 
