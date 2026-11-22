@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <string>
@@ -307,6 +308,9 @@ uint64_t last_dispatch(uint32_t* addr, uint32_t* lr);
 // Debug facilities that are timed (GCRECOMP_WATCH, GCRECOMP_TRACE_CALLS) only act once GCRECOMP_DEBUG_AFTER seconds
 // of wall-clock time have passed since the first call (default 0: always), to skip a boot phase or an earlier scene.
 bool debug_armed();
+// Appends " bt: OFF OFF ..." (the host call chain as offsets in the executable, innermost first) to `out`; no newline.
+// tools/guest-watch.py names the offsets (guest functions of a recompiled game).
+void print_call_chain(std::FILE* out);
 
 // =============================================================================
 // Global runtime state
