@@ -258,6 +258,12 @@ if(GCRECOMP_BUILD_TOOLS)
     )
     target_link_libraries(gcrecomp_recompiler PRIVATE gcrecomp_tools)
     target_include_directories(gcrecomp_recompiler PRIVATE include)
+    if(GCRECOMP_BUILD_TESTS)
+        enable_testing()
+        add_executable(recompiler_rc_test tests/recompiler_rc_test.cpp)
+        target_link_libraries(recompiler_rc_test PRIVATE gcrecomp_tools)
+        add_test(NAME recompiler_rc COMMAND recompiler_rc_test)
+    endif()
 endif()
 
 # ===========================================================================
