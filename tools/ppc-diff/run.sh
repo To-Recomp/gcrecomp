@@ -10,7 +10,8 @@
 #                    when it is given explicitly with --vectors and exists (nothing is generated then)
 #   --scale S, --seed N   passed to gen_vectors.py (more or fewer random cases per instruction)
 #   RUNNER-ARGS      passed to ppc_diff_run (--only, --ignore, --max-report, --verbose)
-# Exit status is that of ppc_diff_run (0: every case matches).
+# Environment: PPC_DIFF_CMAKE_ARGS adds arguments to the cmake configure (for example -DGCRECOMP_FETCH_SDL3=ON on a
+# machine without SDL3). Exit status is that of ppc_diff_run (0: every case matches).
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,7 +27,7 @@ while [ $# -gt 0 ]; do
         --vectors) vectors="$2"; shift 2 ;;
         --scale) gen_args+=(--scale "$2"); shift 2 ;;
         --seed) gen_args+=(--seed "$2"); shift 2 ;;
-        -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
         --) shift; break ;;
         *) echo "unknown argument $1 (see --help)" >&2; exit 2 ;;
     esac
@@ -47,7 +48,8 @@ if [ -z "$vectors" ] || [ ! -f "$vectors" ]; then
 fi
 
 echo "[ppc-diff] building"
-cmake -S "$repo" -B "$build" -G Ninja -DGCRECOMP_BUILD_TESTS=ON -DGCRECOMP_PPC_DIFF_VECTORS="$vectors" >/dev/null
+# shellcheck disable=SC2086
+cmake -S "$repo" -B "$build" -G Ninja -DGCRECOMP_BUILD_TESTS=ON -DGCRECOMP_PPC_DIFF_VECTORS="$vectors" ${PPC_DIFF_CMAKE_ARGS:-} >/dev/null
 ninja -C "$build" ppc_diff_run
 echo "[ppc-diff] running"
 ulimit -s unlimited 2>/dev/null || true
