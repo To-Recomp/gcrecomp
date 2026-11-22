@@ -62,6 +62,22 @@ one representation: `f[i]` is ps0 and `ps1[i]` is ps1; every scalar FP instructi
 instructions against hand-computed results (including a destination register that is also a source, and the
 quantised load/store with saturation and signed scales).
 
+## A screen that stays black (a fade that never ends)
+
+The picture is rendered but a full-screen quad of the game's fade covers it. Find what the game waits for:
+
+1. `GP_TRACE_FRAME=N` (or the script command `trace-frame`) with `GP_TRACE_VERTS=ortho GP_TRACE_BT=ortho` prints the
+   overlay's vertices and the guest call chain that drew it (`tools/guest-watch.py` names the functions). The vertex
+   alpha is read by that function from a global (the fade state: alpha, rate, a flag).
+2. `GCRECOMP_WATCH=` on those globals (SDA-relative: `r13 + offset`, `r13` is the value `__start` loads) shows which guest
+   functions start, step and end the fade, and the values they write. A fade that is never started again means the
+   code that starts it is not reached: the game state machine is waiting for something else.
+3. Asynchronous completions are the usual suspect. The SDK delivers callbacks (DVD reads, card operations) from an
+   interrupt, after the call returned. A replacement that runs the callback inside the call breaks code that sets its
+   own "busy" state after the call (Tales of Symphonia's file loader: slot state 2 "loading" written after the call
+   returns, 3 "loaded" written by the callback); the loader then waits forever. `src/os/dvd_funcs.cpp` and
+   `src/os/card_funcs.cpp` queue the callbacks and run them from the retrace interrupt and from status polls.
+
 ## Audio
 
 Where the sound goes: the SDK's AI functions are replaced (`src/os/ai_funcs.cpp`); the game's PCM blocks reach an

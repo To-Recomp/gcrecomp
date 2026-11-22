@@ -438,6 +438,9 @@ void set_card_image(const std::string& path, size_t size_bytes = 0x200000);
 // from an interrupt after the call returned; here they run when the game polls the card or waits for
 // a retrace (VIWaitForRetrace calls this).
 void card_run_pending_callbacks(PPCContext* ctx, Memory* mem);
+// The same for DVDReadAsync / DVDReadAsyncPrio: the data is in memory when the call returns, the callback runs
+// afterwards (from the retrace interrupt, or when the game polls DVDGetDriveStatus / DVDGetCommandBlockStatus).
+void dvd_run_pending_callbacks(PPCContext* ctx, Memory* mem);
 
 // Mount a GameCube ISO disc image. Parses the disc header, loads the FST
 // (File System Table) into emulated memory, and enables DVD reads directly

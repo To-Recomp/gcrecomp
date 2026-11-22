@@ -60,7 +60,7 @@ def main():
         i = bisect.bisect_right(addrs, off) - 1
         return f"{names[i]}+0x{off - addrs[i]:x}" if i >= 0 else f"0x{off:x}"
 
-    pat = re.compile(r"^(\[watch\] #\d+ write(\d+) (0x[0-9A-Fa-f]+) = 0x[0-9A-Fa-f]+|\[bt\] #\d+()()) bt: (.*)$")
+    pat = re.compile(r"^(\[watch\] #\d+ write(\d+) (0x[0-9A-Fa-f]+) = 0x[0-9A-Fa-f]+|\[bt\](?: #\d+)?()()) bt: (.*)$")
     counts = Counter()
     for line in open(args.log) if args.log else sys.stdin:
         m = pat.match(line.rstrip("\n"))
