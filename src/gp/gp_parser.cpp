@@ -528,13 +528,19 @@ private:
                 std::fprintf(stderr, "\n");
             }
         }
+        // Matrix indices of the draw; a vertex may override them with the indices stored in it.
+        const uint32_t base_pos_mtx = s.matidx_a & 0x3F;
+        uint32_t base_tex_mtx[8];
+        for (int i = 0; i < 8; ++i)
+            base_tex_mtx[i] = i < 4 ? (s.matidx_a >> (6 * (i + 1))) & 0x3F : (s.matidx_b >> (6 * (i - 4))) & 0x3F;
+        // The normal only matters when one of the four channel controls (XF 0x100E..0x1011) has lighting enabled.
+        const bool lit = ((s.xf[0x100E] | s.xf[0x100F] | s.xf[0x1010] | s.xf[0x1011]) & 2) != 0;
         const uint8_t* p = data;
         for (uint32_t v = 0; v < count; ++v) {
             float* out = &vertices_[size_t(v) * kVertexFloats];
-            uint32_t pos_mtx = s.matidx_a & 0x3F;
+            uint32_t pos_mtx = base_pos_mtx;
             uint32_t tex_mtx[8];
-            for (int i = 0; i < 8; ++i)
-                tex_mtx[i] = i < 4 ? (s.matidx_a >> (6 * (i + 1))) & 0x3F : (s.matidx_b >> (6 * (i - 4))) & 0x3F;
+            std::memcpy(tex_mtx, base_tex_mtx, sizeof tex_mtx);
             if (l.pmidx) pos_mtx = *p++ & 0x3F;
             for (int i = 0; i < 8; ++i)
                 if (l.texmidx[i]) tex_mtx[i] = *p++ & 0x3F;
@@ -613,8 +619,8 @@ private:
             const float depth = (far_z + zgc * z_range) / 16777215.0f;
             // Channel colors: material and ambient sources, lights (XF color/alpha channels).
             float lit[2][4];
-            float view_nrm[3];
-            transform_normal(s.xf, pos_mtx, nrm, view_nrm);
+            float view_nrm[3] = {0, 0, 0};
+            if (lit || trace) transform_normal(s.xf, pos_mtx, nrm, view_nrm);
             light_vertex(s.xf, color, view, view_nrm, lit);
             if (trace && trace_n <= 60 && v == 0) {
                 std::fprintf(stderr, "[DRAW]   ndc=(%g %g %g) w=%g lit0=(%g %g %g %g) nrm=(%g %g %g) view_nrm=(%g %g %g) ctrl0=%X ctrl1=%X amb0=%08X mat0=%08X L0col=%08X L1col=%08X L0pos=(%g %g %g) L0dir=(%g %g %g) vcol=(%g %g %g %g)\n",
