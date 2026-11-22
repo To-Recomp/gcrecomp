@@ -591,6 +591,23 @@ private:
                              s.xf[0x100A], s.xf[0x100C], s.xf[0x603 + 0], s.xf[0x603 + 16], s.xf_float(0x60A), s.xf_float(0x60B), s.xf_float(0x60C),
                              s.xf_float(0x60D), s.xf_float(0x60E), s.xf_float(0x60F), color[0][0], color[0][1], color[0][2], color[0][3]);
             }
+            if (trace) {
+                // GP_TRACE_VERTS=first-last: every vertex of those draws of the traced frame (position, vertex
+                // colour 0, lit channel 0, first texture coordinates).
+                static int verts_first = -1, verts_last = -1;
+                static bool verts_ortho = false;
+                static const bool verts_parsed = [] {
+                    if (const char* e = std::getenv("GP_TRACE_VERTS")) {
+                        if (!std::strcmp(e, "ortho")) verts_ortho = true;
+                        else if (std::sscanf(e, "%d-%d", &verts_first, &verts_last) == 1) verts_last = verts_first;
+                    }
+                    return true;
+                }();
+                (void)verts_parsed;
+                if ((trace_n >= verts_first && trace_n <= verts_last) || (verts_ortho && ortho))
+                    std::fprintf(stderr, "[VERT] #%d v%u pos=(%g %g %g) col0=(%g %g %g %g) lit0=(%g %g %g %g) st0=(%g %g)\n", trace_n, v, pos[0], pos[1], pos[2],
+                                 color[0][0], color[0][1], color[0][2], color[0][3], lit[0][0], lit[0][1], lit[0][2], lit[0][3], st[0][0], st[0][1]);
+            }
             if (trace && trace_n <= 3 && v < 4) {
                 std::fprintf(stderr, "[DRAW]   v%u mtx=%u pos=(%g %g %g) view=(%g %g %g) clip=(%g %g %g %g) rows:", v, pos_mtx, pos[0], pos[1], pos[2], view[0], view[1], view[2], cx, cy, cz, cw);
                 for (int r = 0; r < 12; ++r) std::fprintf(stderr, " %g", s.xf_float(m + r));

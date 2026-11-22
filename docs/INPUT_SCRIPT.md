@@ -67,3 +67,9 @@ shot next
 
 `GCRECOMP_CARD_IMAGE=path[:size]` inserts a card image in slot A for a host program that did not call
 `set_card_image()` itself (a missing file starts as a blank, unformatted card the game offers to format).
+
+## Tools
+
+* `tools/run-scripted.sh`: runs a harness with a script file, a fresh card image, screenshots and a log.
+* `tools/guest-stacks.sh PID [DEPTH]`: gdb backtraces of the guest threads of a running harness (guest call chain as `func_XXXXXXXX`).
+* `tools/input-scripts/tos-new-game.txt`: example, Tales of Symphonia from a blank card to the first field scene.
