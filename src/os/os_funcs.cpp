@@ -1041,18 +1041,20 @@ void hle_dump(size_t top) {
 // Reference: libogc ogc/system.h (SYS_GetSoundMode / SYS_SetSoundMode: 0 mono, 1 stereo).
 // =============================================================================
 
+// The rest of the SRAM-derived settings, pinned to a standard console (English, no progressive scan, no
+// EuRGB60, wireless id 0, counter bias 0): the SDK's own getters would return what the zeroed block holds, which
+// is the same today, but nothing then guards it. tests/os_sound_mode_test.cpp pins the values.
 static uint32_t g_sound_mode = [] {
     const char* v = std::getenv("GCRECOMP_SOUND_MODE");
     return uint32_t(v && std::strcmp(v, "mono") == 0 ? 0 : 1);
 }();
+static uint32_t g_language = 0;  // OS_LANG_ENGLISH
 
-static void os_get_sound_mode(PPCContext* ctx, Memory*) {
-    ctx->r[3] = g_sound_mode;
-}
-
-static void os_set_sound_mode(PPCContext* ctx, Memory*) {
-    g_sound_mode = ctx->r[3] == 0 ? 0 : 1;
-}
+static void os_get_sound_mode(PPCContext* ctx, Memory*) { ctx->r[3] = g_sound_mode; }
+static void os_set_sound_mode(PPCContext* ctx, Memory*) { g_sound_mode = ctx->r[3] == 0 ? 0 : 1; }
+static void os_get_language(PPCContext* ctx, Memory*) { ctx->r[3] = g_language; }
+static void os_set_language(PPCContext* ctx, Memory*) { g_language = ctx->r[3] & 0xFF; }
+static void os_return_zero(PPCContext* ctx, Memory*) { ctx->r[3] = 0; }  // progressive, EuRGB60, wireless id, bias
 
 // =============================================================================
 // Init Stubs
@@ -1176,6 +1178,12 @@ static const OSFuncEntry g_os_func_table[] = {
     // --- Sound setting ---
     { "OSGetSoundMode",         os_get_sound_mode },
     { "OSSetSoundMode",         os_set_sound_mode },
+    { "OSGetLanguage",          os_get_language },
+    { "OSSetLanguage",          os_set_language },
+    { "OSGetProgressiveMode",   os_return_zero },
+    { "OSGetEuRgb60Mode",       os_return_zero },
+    { "OSGetWirelessID",        os_return_zero },
+    { "OSGetCounterBias",       os_return_zero },
 
     // --- Init Stubs ---
     { "OSInit",                 os_init_stub },

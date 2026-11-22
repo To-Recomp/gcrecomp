@@ -5,6 +5,7 @@
 // music in mono.
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "gcrecomp/runtime.h"
 
@@ -34,14 +35,22 @@ static uint32_t call(const char* name, uint32_t arg) {
 }
 
 int main() {
-    unsetenv("GCRECOMP_SOUND_MODE");
-    CHECK_EQ(call("OSGetSoundMode", 0), 1);  // stereo by default
+    // The default is read from GCRECOMP_SOUND_MODE when the program starts (an empty or other value is stereo).
+    const char* env = std::getenv("GCRECOMP_SOUND_MODE");
+    if (!env || std::strcmp(env, "mono") != 0) CHECK_EQ(call("OSGetSoundMode", 0), 1);  // stereo by default
     call("OSSetSoundMode", 0);
     CHECK_EQ(call("OSGetSoundMode", 0), 0);
     call("OSSetSoundMode", 1);
     CHECK_EQ(call("OSGetSoundMode", 0), 1);
     call("OSSetSoundMode", 7);  // anything but mono is stereo
     CHECK_EQ(call("OSGetSoundMode", 0), 1);
+    // The console state the game reads from the (never loaded) SRAM: a standard English console.
+    CHECK_EQ(call("OSGetLanguage", 0), 0);
+    call("OSSetLanguage", 3);
+    CHECK_EQ(call("OSGetLanguage", 0), 3);
+    call("OSSetLanguage", 0);
+    for (const char* name : {"OSGetProgressiveMode", "OSGetEuRgb60Mode", "OSGetWirelessID", "OSGetCounterBias"})
+        CHECK_EQ(call(name, 0), 0);
     if (g_failures) return 1;
     std::printf("os sound mode: ok\n");
     return 0;
