@@ -29,6 +29,7 @@ struct State {
 
     // Texture lookup table memory, indexed as (BP 0x65 offset field) * 512 bytes, loaded by BP 0x64/0x65.
     uint8_t tlut[0x400 * 512] = {};
+    uint32_t tlut_gen = 0;  // incremented by every TLUT load: lets the renderer skip re-hashing an unchanged palette
     // BP (raster, TEV, texture, blend, copy): 256 registers of 24 bits.
     uint32_t bp[256] = {};
 

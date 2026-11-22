@@ -46,6 +46,7 @@ int g_shot_count = 0;
 GLuint g_fbo = 0, g_color = 0, g_depth = 0;
 GLuint g_vao = 0, g_vbo = 0, g_program = 0;
 GLuint g_white = 0;
+bool g_efb_bound = false;  // GL_FRAMEBUFFER is the EFB framebuffer (draw() binds it lazily; EFB copies unbind it)
 uint64_t g_indirect_draws = 0;
 // How often the game used the features that are only visible on screen, reported at shutdown.
 struct FeatureUse {
@@ -243,22 +244,73 @@ GLuint compile(GLenum type, const char* source) {
     return shader;
 }
 
+// Sampler state last applied to a cached texture object: glTexParameter calls are skipped while it is unchanged.
+struct SamplerParams {
+    GLint wrap_s = 0, wrap_t = 0, mag = 0, min = 0;
+    float lod_bias = 0, min_lod = 0, max_lod = 0;
+    bool operator==(const SamplerParams& o) const {
+        return wrap_s == o.wrap_s && wrap_t == o.wrap_t && mag == o.mag && min == o.min && lod_bias == o.lod_bias &&
+               min_lod == o.min_lod && max_lod == o.max_lod;
+    }
+};
+
 struct CachedTexture {
     GLuint id = 0;
-    uint64_t hash = 0;
+    uint64_t hash = 0;       // what the GL texture was decoded from: data_hash combined with the palette's
+    uint64_t data_hash = 0;  // hash of the guest bytes, as of the last time they were read
+    uint32_t clock = 0;      // Memory write clock at that time: no store to the texture's pages since means data_hash holds
+    uint64_t hash_frame = 0;
+    uint32_t tlut_gen = ~0u, settlut = 0;  // the palette (State::tlut_gen, the TLUT offset register) tlut_hash is of
+    uint64_t tlut_hash = 0;
+    SamplerParams params;
+    bool params_valid = false;
 };
 std::unordered_map<uint64_t, CachedTexture> g_textures;
 
-uint64_t hash_bytes(const uint8_t* p, size_t n) {
-    uint64_t h = 1469598103934665603ull;
-    size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        uint64_t w;
-        std::memcpy(&w, p + i, 8);
-        h = (h ^ w) * 1099511628211ull;
+// The texture bound to each unit and the active unit, so that a draw that uses what the previous one used issues no GL
+// call. ~0u / -1: unknown.
+GLuint g_bound[8] = {~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
+int g_active_unit = -1;
+
+// Binds `id` to `unit` for sampling; the active unit is left alone when the texture is already bound there.
+void bind_unit_texture(int unit, GLuint id) {
+    if (g_bound[unit] == id) return;
+    if (g_active_unit != unit) {
+        glActiveTexture(GL_TEXTURE0 + unit);
+        g_active_unit = unit;
     }
-    for (; i < n; ++i) h = (h ^ p[i]) * 1099511628211ull;
-    return h;
+    glBindTexture(GL_TEXTURE_2D, id);
+    g_bound[unit] = id;
+}
+
+// The same, and makes `unit` the active one: for the calls that modify the bound texture (glTexImage2D, glTexParameter).
+void edit_unit_texture(int unit, GLuint id) {
+    if (g_active_unit != unit) {
+        glActiveTexture(GL_TEXTURE0 + unit);
+        g_active_unit = unit;
+    }
+    if (g_bound[unit] != id) {
+        glBindTexture(GL_TEXTURE_2D, id);
+        g_bound[unit] = id;
+    }
+}
+
+// Change detection of the guest bytes behind a texture: eight independent multiply-xor lanes (a single FNV chain
+// is latency bound, ~1 GB/s; this one runs at memory speed). Only equality over time matters, not the value.
+uint64_t hash_bytes(const uint8_t* p, size_t n) {
+    constexpr uint64_t kPrime = 1099511628211ull;
+    uint64_t h[8] = {1469598103934665603ull, 0x9E3779B97F4A7C15ull, 0xC2B2AE3D27D4EB4Full, 0x165667B19E3779F9ull,
+                     0x27D4EB2F165667C5ull, 0xD6E8FEB86659FD93ull, 0xFF51AFD7ED558CCDull, 0xC4CEB9FE1A85EC53ull};
+    size_t i = 0;
+    for (; i + 64 <= n; i += 64) {
+        uint64_t w[8];
+        std::memcpy(w, p + i, 64);
+        for (int k = 0; k < 8; ++k) h[k] = (h[k] ^ w[k]) * kPrime;
+    }
+    uint64_t r = n;
+    for (int k = 0; k < 8; ++k) r = (r ^ (h[k] >> 29) ^ h[k]) * kPrime;
+    for (; i < n; ++i) r = (r ^ p[i]) * kPrime;
+    return r;
 }
 
 GLuint texture_for_map(const State& s, int map) {
@@ -272,17 +324,38 @@ GLuint texture_for_map(const State& s, int map) {
     const uint32_t settlut = indexed ? s.bp[map < 4 ? 0x98 + map : 0xB8 + (map - 4)] : 0;
     const uint32_t levels = mip_level_count(w, h, mode0, mode1);
     const size_t bytes = mip_chain_bytes(w, h, fmt, levels);
-    const uint8_t* src = g_mem.translate(addr);
+    const uint8_t* src = g_mem.read_ptr(addr);
     const uint64_t key = (uint64_t(addr) << 24) ^ (uint64_t(w) << 12) ^ (uint64_t(h) << 4) ^ fmt ^ (uint64_t(levels) << 56);
-    uint64_t hash = hash_bytes(src, bytes);
+    CachedTexture& t = g_textures[key];
+    // The guest bytes are hashed to notice that the game rewrote the texture. Reading them all on every use dominated a
+    // frame (thousands of draws per frame use the same few textures), so the hash is kept while the Memory write stamps
+    // (runtime.h) say that no store touched the texture's pages since it was taken. A texture is still re-read every
+    // kRevalidateFrames presented frames, a safety net against a writer that does not stamp, and always with
+    // GP_TEX_VALIDATE=always.
+    static const bool always = [] {
+        const char* v = std::getenv("GP_TEX_VALIDATE");
+        return v && !std::strcmp(v, "always");
+    }();
+    constexpr uint64_t kRevalidateFrames = 120;
+    if (always || t.id == 0 || t.clock == 0 || g_frames - t.hash_frame >= kRevalidateFrames ||
+        g_mem.written_since(addr, uint32_t(bytes), t.clock)) {
+        t.data_hash = hash_bytes(src, bytes);
+        t.hash_frame = g_frames;
+    }
+    t.clock = g_mem.advance_clock();
+    uint64_t hash = t.data_hash;
     if (indexed) {
         // Hash the part of the TLUT the format can reach: 16, 256 or 16384 entries of 2 bytes.
-        const size_t entries = fmt == kTexC4 ? 16 : fmt == kTexC8 ? 256 : 16384;
-        const size_t base = size_t(settlut & 0x3FF) * 512;
-        const size_t len = std::min(entries * 2, sizeof(s.tlut) - base);
-        hash ^= hash_bytes(s.tlut + base, len) * 31 + settlut;
+        if (t.tlut_gen != s.tlut_gen || t.settlut != settlut) {
+            const size_t entries = fmt == kTexC4 ? 16 : fmt == kTexC8 ? 256 : 16384;
+            const size_t base = size_t(settlut & 0x3FF) * 512;
+            const size_t len = std::min(entries * 2, sizeof(s.tlut) - base);
+            t.tlut_hash = hash_bytes(s.tlut + base, len) * 31 + settlut;
+            t.tlut_gen = s.tlut_gen;
+            t.settlut = settlut;
+        }
+        hash ^= t.tlut_hash;
     }
-    CachedTexture& t = g_textures[key];
     if (t.id == 0 || t.hash != hash) {
         auto decode_level = [&](uint32_t level) {
             const uint32_t lw = mip_dim(w, level), lh = mip_dim(h, level);
@@ -317,7 +390,7 @@ GLuint texture_for_map(const State& s, int map) {
             }
         }
         if (t.id == 0) glGenTextures(1, &t.id);
-        glBindTexture(GL_TEXTURE_2D, t.id);
+        edit_unit_texture(map, t.id);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
         for (uint32_t level = 1; level < levels; ++level) {
@@ -330,18 +403,32 @@ GLuint texture_for_map(const State& s, int map) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, GLint(levels - 1));
         t.hash = hash;
+        t.params_valid = false;
     }
-    glBindTexture(GL_TEXTURE_2D, t.id);
-    const GLint wrap[3] = {GL_CLAMP_TO_EDGE, GL_REPEAT, GL_MIRRORED_REPEAT};
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap[(mode0 & 3) % 3]);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap[((mode0 >> 2) & 3) % 3]);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, (mode0 & 0x10) ? GL_LINEAR : GL_NEAREST);
+    bind_unit_texture(map, t.id);
+    static const GLint wrap[3] = {GL_CLAMP_TO_EDGE, GL_REPEAT, GL_MIRRORED_REPEAT};
     static const GLint min_filters[6] = {GL_NEAREST, GL_NEAREST_MIPMAP_NEAREST, GL_NEAREST_MIPMAP_LINEAR,
                                          GL_LINEAR,  GL_LINEAR_MIPMAP_NEAREST,  GL_LINEAR_MIPMAP_LINEAR};
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, min_filters[uint32_t(effective_min_filter(mode0, levels))]);
-    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_LOD_BIAS, lod_bias_of(mode0));
-    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_LOD, min_lod_of(mode1));
-    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_LOD, max_lod_of(mode1));
+    SamplerParams want;
+    want.wrap_s = wrap[(mode0 & 3) % 3];
+    want.wrap_t = wrap[((mode0 >> 2) & 3) % 3];
+    want.mag = (mode0 & 0x10) ? GL_LINEAR : GL_NEAREST;
+    want.min = min_filters[uint32_t(effective_min_filter(mode0, levels))];
+    want.lod_bias = lod_bias_of(mode0);
+    want.min_lod = min_lod_of(mode1);
+    want.max_lod = max_lod_of(mode1);
+    if (!t.params_valid || !(t.params == want)) {
+        edit_unit_texture(map, t.id);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, want.wrap_s);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, want.wrap_t);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, want.mag);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, want.min);
+        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_LOD_BIAS, want.lod_bias);
+        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_LOD, want.min_lod);
+        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_LOD, want.max_lod);
+        t.params = want;
+        t.params_valid = true;
+    }
     return t.id;
 }
 
@@ -363,43 +450,121 @@ GLenum compare_func(uint32_t f) {
     return table[f & 7];
 }
 
-void set_uniform_1i(const char* name, int v) { glUniform1i(glGetUniformLocation(g_program, name), v); }
+// Uniform locations, looked up once after the link (glGetUniformLocation by name per draw was a large share of a frame).
+struct UniformLocations {
+    GLint nstages = -1, stage = -1, swap = -1, reg = -1, konst = -1, alpha_cmp = -1, fog_f = -1, fog_i = -1, fog_color = -1,
+          const_alpha = -1;
+} g_loc;
+
+// A uniform's last uploaded words: the upload is skipped when the new value is bit-identical.
+template <size_t N>
+struct UniformShadow {
+    bool valid = false;
+    uint32_t w[N] = {};
+    // Records `p` (N words); true when it differs from what the GL program holds.
+    bool changed(const void* p) {
+        if (valid && std::memcmp(w, p, N * sizeof(uint32_t)) == 0) return false;
+        std::memcpy(w, p, N * sizeof(uint32_t));
+        valid = true;
+        return true;
+    }
+};
+
+// What apply_state last told GL, so that a draw whose state equals the previous one's issues no GL call for it. Anything
+// else that changes this state (EFB copies, the early-Z replay) must reset it: invalidate_shadow(). -1 / false: unknown.
+struct Shadow {
+    int scissor_on = -1;
+    bool scissor_valid = false, viewport_valid = false, blend_func_valid = false, blend_eq_valid = false, logic_valid = false;
+    GLint scissor[4] = {}, viewport[4] = {};
+    int cull = -1;  // 0: culling off, else the GL face mode
+    int depth_test = -1, depth_mask = -1;
+    GLenum depth_func = 0;
+    int blend_on = -1;
+    GLenum blend_func[4] = {}, blend_eq[2] = {};
+    int logic_on = -1;
+    GLenum logic_op = 0;
+    int color_mask = -1;
+    UniformShadow<1> const_alpha, nstages;
+    UniformShadow<64> stage;
+    UniformShadow<16> swap, reg, konst;
+    UniformShadow<2> alpha_cmp;
+    UniformShadow<4> fog_f, fog_i;
+    UniformShadow<3> fog_color;
+} g_sh;
+
+void invalidate_shadow() { g_sh = Shadow(); }
+
+template <size_t N>
+bool same(const GLint (&a)[N], const GLint (&b)[N]) {
+    return std::memcmp(a, b, sizeof a) == 0;
+}
 
 void apply_state(const State& s) {
-    glUseProgram(g_program);
-
     // Viewport and scissor, in EFB coordinates (origin top-left) converted to GL (origin bottom-left).
     const float wd = s.xf_float(0x101A), ht = s.xf_float(0x101B), xo = s.xf_float(0x101D), yo = s.xf_float(0x101E);
     const float x_off = float((s.bp[0x59] & 0x3FF) * 2), y_off = float(((s.bp[0x59] >> 10) & 0x3FF) * 2);
     const float vx = xo - wd - x_off, vy = yo + ht - y_off, vw = 2.0f * wd, vh = -2.0f * ht;
-    if (vw > 0 && vh > 0) glViewport(int(vx), int(kEfbHeight - (vy + vh)), int(vw), int(vh));
+    if (vw > 0 && vh > 0) {
+        const GLint vp[4] = {int(vx), int(kEfbHeight - (vy + vh)), int(vw), int(vh)};
+        if (!g_sh.viewport_valid || !same(g_sh.viewport, vp)) {
+            glViewport(vp[0], vp[1], vp[2], vp[3]);
+            std::memcpy(g_sh.viewport, vp, sizeof vp);
+            g_sh.viewport_valid = true;
+        }
+    }
 
     const uint32_t tl = s.bp[0x20], br = s.bp[0x21];
     const int sx = int((tl >> 12) & 0x7FF) - 342, sy = int(tl & 0x7FF) - 342;
     const int sx2 = int((br >> 12) & 0x7FF) - 342, sy2 = int(br & 0x7FF) - 342;
     const int sw = sx2 - sx + 1, sh = sy2 - sy + 1;
-    glEnable(GL_SCISSOR_TEST);
-    if (sw > 0 && sh > 0) glScissor(sx, kEfbHeight - (sy + sh), sw, sh);
+    if (g_sh.scissor_on != 1) {
+        glEnable(GL_SCISSOR_TEST);
+        g_sh.scissor_on = 1;
+    }
+    if (sw > 0 && sh > 0) {
+        const GLint sc[4] = {sx, kEfbHeight - (sy + sh), sw, sh};
+        if (!g_sh.scissor_valid || !same(g_sh.scissor, sc)) {
+            glScissor(sc[0], sc[1], sc[2], sc[3]);
+            std::memcpy(g_sh.scissor, sc, sizeof sc);
+            g_sh.scissor_valid = true;
+        }
+    }
 
     // GP_CULL=none: debugging aid, disables face culling.
     static const bool no_cull = std::getenv("GP_CULL") && !std::strcmp(std::getenv("GP_CULL"), "none");
     const uint32_t cull = no_cull ? 0 : (s.bp[0x00] >> 14) & 3;
-    if (cull == 0) glDisable(GL_CULL_FACE);
-    else {
-        glEnable(GL_CULL_FACE);
-        // GenMode cull field: 1 culls the faces GX calls back, 2 the front ones. GX's screen space has y down, OpenGL's
-        // clip space y up, so a triangle GX sees counter-clockwise is clockwise here: the faces swap.
-        glCullFace(cull == 1 ? GL_FRONT : cull == 2 ? GL_BACK : GL_FRONT_AND_BACK);
+    // GenMode cull field: 1 culls the faces GX calls back, 2 the front ones. GX's screen space has y down, OpenGL's
+    // clip space y up, so a triangle GX sees counter-clockwise is clockwise here: the faces swap.
+    const int cull_mode = cull == 0 ? 0 : int(cull == 1 ? GL_FRONT : cull == 2 ? GL_BACK : GL_FRONT_AND_BACK);
+    if (g_sh.cull != cull_mode) {
+        if (cull_mode == 0) {
+            glDisable(GL_CULL_FACE);
+        } else {
+            if (g_sh.cull <= 0) glEnable(GL_CULL_FACE);
+            glCullFace(GLenum(cull_mode));
+        }
+        g_sh.cull = cull_mode;
     }
 
     const uint32_t zmode = s.bp[0x40];
-    if (zmode & 1) {
-        glEnable(GL_DEPTH_TEST);
-        glDepthFunc(compare_func((zmode >> 1) & 7));
-    } else {
-        glDisable(GL_DEPTH_TEST);
+    const int depth_test = zmode & 1;
+    if (g_sh.depth_test != depth_test) {
+        if (depth_test) glEnable(GL_DEPTH_TEST);
+        else glDisable(GL_DEPTH_TEST);
+        g_sh.depth_test = depth_test;
     }
-    glDepthMask((zmode & 0x10) ? GL_TRUE : GL_FALSE);
+    if (depth_test) {
+        const GLenum func = compare_func((zmode >> 1) & 7);
+        if (g_sh.depth_func != func) {
+            glDepthFunc(func);
+            g_sh.depth_func = func;
+        }
+    }
+    const int depth_mask = (zmode & 0x10) ? 1 : 0;
+    if (g_sh.depth_mask != depth_mask) {
+        glDepthMask(depth_mask ? GL_TRUE : GL_FALSE);
+        g_sh.depth_mask = depth_mask;
+    }
 
     const BlendState blend = decode_blend(s.bp[0x41], s.bp[0x42]);
     // Constant alpha: o_color.a carries the constant, so the blend factors that use the source alpha read
@@ -411,25 +576,52 @@ void apply_state(const State& s) {
         return blend_factor(f, is_src);
     };
     if (blend.blend) {
-        glEnable(GL_BLEND);
+        if (g_sh.blend_on != 1) {
+            glEnable(GL_BLEND);
+            g_sh.blend_on = 1;
+        }
         const GLenum src = factor(blend.src_factor, true), dst = factor(blend.dst_factor, false);
-        if (const_alpha) glBlendFuncSeparate(src, dst, GL_ONE, GL_ZERO);
-        else glBlendFunc(src, dst);
+        const GLenum func[4] = {src, dst, const_alpha ? GLenum(GL_ONE) : src, const_alpha ? GLenum(GL_ZERO) : dst};
+        if (!g_sh.blend_func_valid || std::memcmp(g_sh.blend_func, func, sizeof func) != 0) {
+            glBlendFuncSeparate(func[0], func[1], func[2], func[3]);
+            std::memcpy(g_sh.blend_func, func, sizeof func);
+            g_sh.blend_func_valid = true;
+        }
         const GLenum rgb_eq = blend.subtract ? GL_FUNC_REVERSE_SUBTRACT : GL_FUNC_ADD;
-        glBlendEquationSeparate(rgb_eq, const_alpha ? GL_FUNC_ADD : rgb_eq);
-    } else {
+        const GLenum eq[2] = {rgb_eq, const_alpha ? GLenum(GL_FUNC_ADD) : rgb_eq};
+        if (!g_sh.blend_eq_valid || std::memcmp(g_sh.blend_eq, eq, sizeof eq) != 0) {
+            glBlendEquationSeparate(eq[0], eq[1]);
+            std::memcpy(g_sh.blend_eq, eq, sizeof eq);
+            g_sh.blend_eq_valid = true;
+        }
+    } else if (g_sh.blend_on != 0) {
         glDisable(GL_BLEND);
+        g_sh.blend_on = 0;
     }
     if (const_alpha) ++g_use.const_alpha_draws;
     if (blend.logic_op) {
         ++g_use.logic_op_draws;
-        glEnable(GL_COLOR_LOGIC_OP);
-        glLogicOp(GL_CLEAR + blend.logic_mode);  // GX_LO_* follows the GL enum order
-    } else {
+        if (g_sh.logic_on != 1) {
+            glEnable(GL_COLOR_LOGIC_OP);
+            g_sh.logic_on = 1;
+        }
+        const GLenum op = GL_CLEAR + blend.logic_mode;  // GX_LO_* follows the GL enum order
+        if (!g_sh.logic_valid || g_sh.logic_op != op) {
+            glLogicOp(op);
+            g_sh.logic_op = op;
+            g_sh.logic_valid = true;
+        }
+    } else if (g_sh.logic_on != 0) {
         glDisable(GL_COLOR_LOGIC_OP);
+        g_sh.logic_on = 0;
     }
-    glUniform1f(glGetUniformLocation(g_program, "u_const_alpha"), const_alpha ? float(blend.const_alpha_value) / 255.0f : -1.0f);
-    glColorMask(blend.color_update, blend.color_update, blend.color_update, blend.alpha_update);
+    const float const_alpha_value = const_alpha ? float(blend.const_alpha_value) / 255.0f : -1.0f;
+    if (g_sh.const_alpha.changed(&const_alpha_value)) glUniform1f(g_loc.const_alpha, const_alpha_value);
+    const int color_mask = (blend.color_update ? 7 : 0) | (blend.alpha_update ? 8 : 0);
+    if (g_sh.color_mask != color_mask) {
+        glColorMask(blend.color_update, blend.color_update, blend.color_update, blend.alpha_update);
+        g_sh.color_mask = color_mask;
+    }
 
     // TEV stages.
     const int nstages = int(((s.bp[0x00] >> 10) & 0xF) + 1);
@@ -446,8 +638,8 @@ void apply_state(const State& s) {
         stage[i][2] = map | (coord << 3) | (enable << 6) | (chan << 7);
         stage[i][3] = kc | (ka << 5);
     }
-    glUniform1i(glGetUniformLocation(g_program, "u_nstages"), nstages);
-    glUniform4uiv(glGetUniformLocation(g_program, "u_stage"), 16, &stage[0][0]);
+    if (g_sh.nstages.changed(&nstages)) glUniform1i(g_loc.nstages, nstages);
+    if (g_sh.stage.changed(stage)) glUniform4uiv(g_loc.stage, 16, &stage[0][0]);
 
     int swap[4][4];
     for (int t = 0; t < 4; ++t) {
@@ -457,33 +649,31 @@ void apply_state(const State& s) {
         swap[t][2] = int(hi & 3);
         swap[t][3] = int((hi >> 2) & 3);
     }
-    glUniform4iv(glGetUniformLocation(g_program, "u_swap"), 4, &swap[0][0]);
-    glUniform4fv(glGetUniformLocation(g_program, "u_reg"), 4, &s.tev_reg[0][0]);
-    glUniform4fv(glGetUniformLocation(g_program, "u_konst"), 4, &s.tev_konst[0][0]);
+    if (g_sh.swap.changed(swap)) glUniform4iv(g_loc.swap, 4, &swap[0][0]);
+    if (g_sh.reg.changed(s.tev_reg)) glUniform4fv(g_loc.reg, 4, &s.tev_reg[0][0]);
+    if (g_sh.konst.changed(s.tev_konst)) glUniform4fv(g_loc.konst, 4, &s.tev_konst[0][0]);
 
     const uint32_t ac = s.bp[0xF3];
-    const uint32_t cmp = ((ac >> 16) & 7) | (((ac >> 19) & 7) << 3) | (((ac >> 22) & 3) << 6);
-    const uint32_t refs = (ac & 0xFF) | (((ac >> 8) & 0xFF) << 8);
-    glUniform2ui(glGetUniformLocation(g_program, "u_alpha_cmp"), cmp, refs);
+    const uint32_t alpha_cmp[2] = {((ac >> 16) & 7) | (((ac >> 19) & 7) << 3) | (((ac >> 22) & 3) << 6),
+                                   (ac & 0xFF) | (((ac >> 8) & 0xFF) << 8)};
+    if (g_sh.alpha_cmp.changed(alpha_cmp)) glUniform2ui(g_loc.alpha_cmp, alpha_cmp[0], alpha_cmp[1]);
 
     const FogParams fog = decode_fog(s.bp);
     if (fog.type != kFogOff) ++g_use.fog_draws;
-    glUniform4f(glGetUniformLocation(g_program, "u_fog_f"), fog.a, fog.c, 0.0f, 0.0f);
-    glUniform4i(glGetUniformLocation(g_program, "u_fog_i"), GLint(fog.b_mag), GLint(fog.b_shift), fog.ortho ? 1 : 0,
-                GLint(fog.type));
-    glUniform3fv(glGetUniformLocation(g_program, "u_fog_color"), 1, fog.color);
+    const float fog_f[4] = {fog.a, fog.c, 0.0f, 0.0f};
+    if (g_sh.fog_f.changed(fog_f)) glUniform4f(g_loc.fog_f, fog_f[0], fog_f[1], fog_f[2], fog_f[3]);
+    const int fog_i[4] = {GLint(fog.b_mag), GLint(fog.b_shift), fog.ortho ? 1 : 0, GLint(fog.type)};
+    if (g_sh.fog_i.changed(fog_i)) glUniform4i(g_loc.fog_i, fog_i[0], fog_i[1], fog_i[2], fog_i[3]);
+    if (g_sh.fog_color.changed(fog.color)) glUniform3fv(g_loc.fog_color, 1, fog.color);
 
-    // Textures: bind the maps the stages use; the others get the white texture.
+    // Textures: bind the maps the stages use; the others get the white texture. (The samplers u_tex0..7 are set to
+    // their units once, in init.)
     bool used[8] = {};
     for (int i = 0; i < nstages; ++i)
         if ((stage[i][2] >> 6) & 1) used[stage[i][2] & 7] = true;
     for (int m = 0; m < 8; ++m) {
-        glActiveTexture(GL_TEXTURE0 + m);
         if (used[m]) texture_for_map(s, m);
-        else glBindTexture(GL_TEXTURE_2D, g_white);
-        char name[16];
-        std::snprintf(name, sizeof(name), "u_tex%d", m);
-        set_uniform_1i(name, m);
+        else bind_unit_texture(m, g_white);
     }
 }
 
@@ -617,6 +807,22 @@ bool init(int window_w, int window_h, const char* screenshot_dir, int max_screen
         std::fprintf(stderr, "[GL] link failed:\n%s\n", log);
         return false;
     }
+    glUseProgram(g_program);  // the only program: apply_state does not select it again
+    g_loc.nstages = glGetUniformLocation(g_program, "u_nstages");
+    g_loc.stage = glGetUniformLocation(g_program, "u_stage");
+    g_loc.swap = glGetUniformLocation(g_program, "u_swap");
+    g_loc.reg = glGetUniformLocation(g_program, "u_reg");
+    g_loc.konst = glGetUniformLocation(g_program, "u_konst");
+    g_loc.alpha_cmp = glGetUniformLocation(g_program, "u_alpha_cmp");
+    g_loc.fog_f = glGetUniformLocation(g_program, "u_fog_f");
+    g_loc.fog_i = glGetUniformLocation(g_program, "u_fog_i");
+    g_loc.fog_color = glGetUniformLocation(g_program, "u_fog_color");
+    g_loc.const_alpha = glGetUniformLocation(g_program, "u_const_alpha");
+    for (int m = 0; m < 8; ++m) {
+        char name[16];
+        std::snprintf(name, sizeof(name), "u_tex%d", m);
+        glUniform1i(glGetUniformLocation(g_program, name), m);
+    }
 
     glGenVertexArrays(1, &g_vao);
     glGenBuffers(1, &g_vbo);
@@ -682,15 +888,17 @@ void draw(const DrawCall& call, const State& s) {
                          (unsigned long long)calls, (s.bp[0x00] >> 16) & 7, ind);
         }
     }
-    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+    if (!g_efb_bound) {
+        glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+        g_efb_bound = true;
+    }
     apply_state(s);
-    glBindVertexArray(g_vao);
-    glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
 
     const float* data = call.vertices;
     GLenum mode = GL_TRIANGLES;
     uint32_t count = call.vertex_count;
-    std::vector<float> expanded;
+    static std::vector<float> expanded;  // reused between draws
+    expanded.clear();
     switch (call.primitive) {
         case kQuads: {
             expanded.reserve(size_t(count) / 4 * 6 * kVertexFloats);
@@ -716,7 +924,8 @@ void draw(const DrawCall& call, const State& s) {
     }
     if (count == 0) return;
     glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(size_t(count) * kVertexFloats * sizeof(float)), data, GL_STREAM_DRAW);
-    if (std::getenv("GP_XHIST")) {
+    static const bool xhist = std::getenv("GP_XHIST") != nullptr;
+    if (xhist) {
         static float minx = 1e9f, maxx = -1e9f, miny = 1e9f, maxy = -1e9f;
         static int frame_draws = 0;
         for (uint32_t v = 0; v < count; ++v) {
@@ -738,7 +947,9 @@ void draw(const DrawCall& call, const State& s) {
         // restores the color mask and the alpha test uniform for the next draw.
         ++g_use.early_z_passes;
         glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
-        glUniform2ui(glGetUniformLocation(g_program, "u_alpha_cmp"), 7u | (7u << 3), 0u);
+        glUniform2ui(g_loc.alpha_cmp, 7u | (7u << 3), 0u);
+        g_sh.color_mask = -1;  // the next apply_state restores both
+        g_sh.alpha_cmp.valid = false;
         glDrawArrays(mode, 0, GLsizei(count));
     }
 }
@@ -776,9 +987,13 @@ static void copy_efb_to_memory(const State& s, uint32_t copy_cmd) {
     };
     if (p.depth) flip(depth, size_t(p.w)); else flip(rgba, size_t(p.w) * 4);
     encode_efb_copy(p, rgba.data(), p.depth ? depth.data() : nullptr, g_mem.translate(addr));
+    g_mem.mark_written(addr | Memory::MAIN_RAM_BASE, uint32_t(efb_copy_extent(p)));  // the cached textures made from this memory are stale
 }
 
 void copy_efb(const CopyRequest& r, const State& s) {
+    // An EFB copy changes framebuffer bindings, viewport, scissor, color and depth masks: forget what apply_state set.
+    g_efb_bound = false;
+    invalidate_shadow();
     static int traced = 0;
     if (traced < 6 && std::getenv("GP_TRACE")) {
         ++traced;

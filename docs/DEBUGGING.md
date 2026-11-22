@@ -18,6 +18,7 @@ Switches and tools for finding out why a frame looks wrong. Nothing here needs a
 | `GP_DUMP_TEX_AFTER=n` | Skip textures used before frame `n` (a movie, an earlier scene). |
 | `GP_SHOT_EVERY=n` | Screenshot (PPM, window size) every `n` presented frames, into the screenshot directory of the host program. |
 | `GP_XHIST=1` | Histogram of XF register writes at exit. |
+| `GP_TEX_VALIDATE=always` | Re-reads every texture's guest bytes on every use, as the renderer did before the write stamps (docs/BENCHMARK.md): a texture that looks stale with the default and right with this has a writer into guest RAM that does not call `Memory::mark_written`. Without it a texture is re-read when a store touched its pages, and in any case every 120 presented frames. |
 
 ## Environment variables (guest memory and calls)
 

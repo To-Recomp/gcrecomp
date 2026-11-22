@@ -117,6 +117,7 @@ std::string read_name(Memory* mem, uint32_t addr) {
 uint8_t* guest_buf(Memory* mem, uint32_t addr, uint32_t len) {
     uint32_t base = addr >= Memory::UNCACHED_BASE ? Memory::UNCACHED_BASE : Memory::MAIN_RAM_BASE;
     if (addr < base || (uint64_t)(addr - base) + len > mem->ram_size) return nullptr;
+    mem->mark_written(addr, len);  // the caller may write through the pointer (CARDRead)
     return mem->ram + (addr - base);
 }
 

@@ -47,7 +47,10 @@ bool dma(Memory* mem, uint32_t type, uint32_t main_addr, uint32_t aram_addr, uin
         return false;
     }
     if (type == 0) std::memcpy(aram() + aram_addr, host, length);
-    else std::memcpy(host, aram() + aram_addr, length);
+    else {
+        std::memcpy(host, aram() + aram_addr, length);
+        mem->mark_written(main_addr, length);
+    }
     return true;
 }
 

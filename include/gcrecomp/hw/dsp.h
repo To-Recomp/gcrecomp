@@ -95,6 +95,11 @@ private:
     void mail_from_cpu(uint32_t mail, uint8_t* ram, size_t ram_size);
     void axucode_mail(uint32_t mail, uint8_t* ram, size_t ram_size);
     void aram_dma(uint8_t* ram, size_t ram_size);
+public:
+    // The last ARAM -> main memory DMA wrote [ram_write_off, +ram_write_len) of RAM; whoever delivered the register write
+    // (Memory) stamps those pages and clears the length (Memory::mark_written).
+    uint32_t ram_write_off = 0, ram_write_len = 0;
+private:
 
     uint8_t regs_[kSize] = {};
     uint16_t control_ = 0;
