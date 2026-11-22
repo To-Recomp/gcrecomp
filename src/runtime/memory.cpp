@@ -157,11 +157,11 @@ bool Memory::written_since(uint32_t addr, uint32_t len, uint32_t clock) const {
     return false;
 }
 
-uint8_t* Memory::translate_impl(uint32_t addr) {
+void Memory::tick_slow(uint32_t addr) const {
     // Heartbeat: prove the recompiled CPU is making forward progress.
     // Fires every 16M memory ops (~once per second for typical code).
-    uint64_t& op_count = bench::g_mem_ops;
-    if ((++op_count & 0xFFFFFF) == 0) {
+    const uint64_t op_count = bench::g_mem_ops;
+    if ((op_count & 0xFFFFFF) == 0) {
         printf("[HB] %llu mem ops, last addr 0x%08X\n",
                (unsigned long long)op_count, addr);
         fflush(stdout);
@@ -171,10 +171,15 @@ uint8_t* Memory::translate_impl(uint32_t addr) {
     // have come due (alarms, the VI retrace, the DSP and the AI DMA), as a game spinning on a flag one of
     // their handlers sets never reaches an OS call. All of them are cheap when nothing is due.
     if ((op_count & 0x3FFFF) == 0) {
-        sched::poll(nullptr, this);
-        if (sched::interrupts_enabled()) ai_poll(&g_ctx, this);
-        dsp_poll(&g_ctx, this);
+        Memory* self = const_cast<Memory*>(this);
+        sched::poll(nullptr, self);
+        if (sched::interrupts_enabled()) ai_poll(&g_ctx, self);
+        dsp_poll(&g_ctx, self);
     }
+}
+
+uint8_t* Memory::translate_impl(uint32_t addr) {
+    tick(addr);
     // Cached region: 0x80000000 - 0x80000000+ram_size
     if (addr >= MAIN_RAM_BASE && addr < ram_end) {
         return ram + (addr - MAIN_RAM_BASE);
@@ -217,11 +222,11 @@ static void vi_beam_read(const uint8_t* hw_regs, uint32_t addr) {
 }
 
 // Big-endian reads (GameCube byte order)
-uint8_t Memory::read8(uint32_t addr) const {
+uint8_t Memory::read8_slow(uint32_t addr) const {
     return *translate(addr);
 }
 
-uint16_t Memory::read16(uint32_t addr) const {
+uint16_t Memory::read16_slow(uint32_t addr) const {
     // Spin-detection: when a HW reg is read >100K times in a row from
     // the same address, the game is polling for something. Print the
     // value so we can identify which bits it expects to change.
@@ -250,7 +255,7 @@ uint16_t Memory::read16(uint32_t addr) const {
     return ((uint16_t)p[0] << 8) | p[1];
 }
 
-uint32_t Memory::read32(uint32_t addr) const {
+uint32_t Memory::read32_slow(uint32_t addr) const {
     if (is_dsp_reg(addr)) return g_dsp.read(addr - DspInterface::kBase, 4);
     vi_beam_read(hw_regs, addr);
     // HW register HLE for reads
@@ -303,24 +308,6 @@ uint32_t Memory::read32(uint32_t addr) const {
     const uint8_t* p = translate(addr);
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
            ((uint32_t)p[2] << 8) | p[3];
-}
-
-uint64_t Memory::read64(uint32_t addr) const {
-    return ((uint64_t)read32(addr) << 32) | read32(addr + 4);
-}
-
-float Memory::readf32(uint32_t addr) const {
-    uint32_t v = read32(addr);
-    float f;
-    memcpy(&f, &v, 4);
-    return f;
-}
-
-double Memory::readf64(uint32_t addr) const {
-    uint64_t v = read64(addr);
-    double d;
-    memcpy(&d, &v, 8);
-    return d;
 }
 
 // ---- Hardware Register HLE ----
@@ -398,7 +385,7 @@ void (*g_wgp_write)(uint32_t size, uint64_t value) = nullptr;
 
 static constexpr uint32_t kWgpAddr = 0xCC008000;
 
-void Memory::write8(uint32_t addr, uint8_t val) {
+void Memory::write8_slow(uint32_t addr, uint8_t val) {
     watch_check(addr, 1, val);
     if (addr == kWgpAddr && g_wgp_write) {
         g_wgp_write(1, val);
@@ -407,7 +394,7 @@ void Memory::write8(uint32_t addr, uint8_t val) {
     *translate(addr) = val;
 }
 
-void Memory::write16(uint32_t addr, uint16_t val) {
+void Memory::write16_slow(uint32_t addr, uint16_t val) {
     watch_check(addr, 2, val);
     if (addr == kWgpAddr && g_wgp_write) {
         g_wgp_write(2, val);
@@ -428,7 +415,7 @@ void Memory::write16(uint32_t addr, uint16_t val) {
     p[1] = (uint8_t)val;
 }
 
-void Memory::write32(uint32_t addr, uint32_t val) {
+void Memory::write32_slow(uint32_t addr, uint32_t val) {
     watch_check(addr, 4, val);
     if (addr == kWgpAddr && g_wgp_write) {
         g_wgp_write(4, val);
@@ -452,25 +439,13 @@ void Memory::write32(uint32_t addr, uint32_t val) {
     p[3] = (uint8_t)val;
 }
 
-void Memory::write64(uint32_t addr, uint64_t val) {
+void Memory::write64_slow(uint32_t addr, uint64_t val) {
     if (addr == kWgpAddr && g_wgp_write) {
         g_wgp_write(8, val);
         return;
     }
     write32(addr, (uint32_t)(val >> 32));
     write32(addr + 4, (uint32_t)val);
-}
-
-void Memory::writef32(uint32_t addr, float val) {
-    uint32_t v;
-    memcpy(&v, &val, 4);
-    write32(addr, v);
-}
-
-void Memory::writef64(uint32_t addr, double val) {
-    uint64_t v;
-    memcpy(&v, &val, 8);
-    write64(addr, v);
 }
 
 } // namespace gcrecomp
