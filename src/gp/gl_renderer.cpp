@@ -855,7 +855,8 @@ void shutdown() {
 void draw(const DrawCall& call, const State& s) {
     static uint64_t calls = 0;
     ++calls;
-    if ((calls == 1 || calls == 5000 || calls == 30000 || calls == 100000) && std::getenv("GP_TRACE")) {
+    static const bool gp_trace = std::getenv("GP_TRACE") != nullptr;
+    if ((calls == 1 || calls == 5000 || calls == 30000 || calls == 100000) && gp_trace) {
         std::fprintf(stderr, "[GL] ---- draw #%llu\n", (unsigned long long)calls);
         const int nst = int(((s.bp[0x00] >> 10) & 0xF) + 1);
         std::fprintf(stderr, "[GL] draw prim=%u n=%u genmode=%06X ntev=%d zmode=%02X blend=%04X acmp=%06X\n", unsigned(call.primitive),
@@ -1025,14 +1026,15 @@ void copy_efb(const CopyRequest& r, const State& s) {
     g_efb_bound = false;
     invalidate_shadow();
     static int traced = 0;
-    if (traced < 6 && std::getenv("GP_TRACE")) {
+    static const bool gp_trace = std::getenv("GP_TRACE") != nullptr;
+    if (traced < 6 && gp_trace) {
         ++traced;
         std::fprintf(stderr, "[GL] copy to_xfb=%d clear=%d src=(%d,%d) %dx%d bp4D=%06X bp4E=%06X window=%dx%d\n", r.to_xfb, r.clear, r.x, r.y,
                      r.w, r.h, s.bp[0x4D], s.bp[0x4E], g_window_w, g_window_h);
     }
     if (r.to_xfb) {
         static uint64_t presented = 0;
-        if (++presented % 600 == 0 && std::getenv("GP_TRACE")) print_feature_use();
+        if (++presented % 600 == 0 && gp_trace) print_feature_use();
         // Blit the copied EFB region to the window and present.
         glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);

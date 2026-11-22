@@ -33,6 +33,12 @@ bool g_graphics = false;
 
 namespace {
 
+// GP_TRACE: asked once, not per command (getenv is a linear scan of the environment).
+bool gp_trace_enabled() {
+    static const bool on = std::getenv("GP_TRACE") != nullptr;
+    return on;
+}
+
 // True while the frame being drawn is the one GP_TRACE_FRAME or request_trace_frame() names.
 bool tracing_frame() {
     static const long env_trace_frame = std::getenv("GP_TRACE_FRAME") ? std::atol(std::getenv("GP_TRACE_FRAME")) : -1;
@@ -253,7 +259,7 @@ private:
                     return 0;
                 }
                 ++g_stats.commands;
-                if (count > 64 && std::getenv("GP_TRACE")) {
+                if (count > 64 && gp_trace_enabled()) {
                     std::fprintf(stderr, "[GP] XF load addr=0x%04X count=%u; bytes:", addr, count);
                     for (int i = 0; i < 24; ++i) std::fprintf(stderr, " %02X", p[i]);
                     std::fprintf(stderr, "\n");
@@ -262,7 +268,7 @@ private:
                     if (addr + i < 0x1100) g_state.xf[addr + i] = be32(p + 5 + 4 * i);
                 }
                 g_stats.xf_writes += count;
-                if ((addr == 0x101A || addr == 0x1020) && trace_xf_ < 10 && std::getenv("GP_TRACE")) {
+                if ((addr == 0x101A || addr == 0x1020) && trace_xf_ < 10 && gp_trace_enabled()) {
                     ++trace_xf_;
                     std::fprintf(stderr, "[GP] XF 0x%04X count=%u lr=0x%08X:", addr, count, g_ctx.lr);
                     for (uint32_t i = 0; i < count && i < 8; ++i) {
@@ -304,7 +310,7 @@ private:
                 return 0;
             }
             ++g_stats.commands;
-            if (trace_draws_ < 12 && std::getenv("GP_TRACE")) {
+            if (trace_draws_ < 12 && gp_trace_enabled()) {
                 ++trace_draws_;
                 std::fprintf(stderr, "[GP] draw cmd=0x%02X prim=%u count=%u fmt=%u vsize=%u vcd=%06X/%04X vat=%08X/%08X/%08X\n", cmd,
                              (cmd >> 3) & 7, count, cmd & 7, layout.size, g_state.vcd_lo, g_state.vcd_hi, g_state.vat[0][cmd & 7],
