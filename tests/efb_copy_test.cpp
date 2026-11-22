@@ -168,7 +168,12 @@ int main() {
         CHECK(z16[0] == 0x12 && z16[1] == 0x34, "Z16 %02X%02X", z16[0], z16[1]);
         auto z24 = encode(params(cmd(kZ24X8), 4, 4, 0x100, true), dummy, &z);
         CHECK(z24[0] == 0xFF && z24[1] == 0x12 && z24[32] == 0x34 && z24[33] == 0x56, "Z24X8 %02X %02X %02X %02X", z24[0], z24[1], z24[32], z24[33]);
-        auto z4 = encode(params(cmd(kZ4), 8, 8, 0x100, true), dummy, &z);
+        // An 8x8 copy reads 64 depth values and 64 pixels: size the inputs to the copy (they were 32, which the
+        // encoder read past the end of; MSVC's debug-heap layout crashed on it).
+        std::vector<uint32_t> z64(8 * 8);
+        for (int i = 0; i < 8 * 8; ++i) z64[i] = 0x123456u + uint32_t(i) * 0x010203u;
+        const std::vector<uint8_t> dummy64(8 * 8 * 4, 0);
+        auto z4 = encode(params(cmd(kZ4), 8, 8, 0x100, true), dummy64, &z64);
         CHECK(z4[0] >> 4 == 1, "Z4 %02X", z4[0]);
     }
 
