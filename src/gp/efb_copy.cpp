@@ -121,31 +121,39 @@ size_t efb_copy_extent(const EfbCopyParams& p) {
     return (rows - 1) * p.stride + cols * size_t(tb);
 }
 
-void encode_efb_copy(const EfbCopyParams& p, const uint8_t* rgba, const uint32_t* z, uint8_t* dst) {
-    int ow, oh, tw, th, tb;
-    efb_copy_output_size(p, &ow, &oh);
-    efb_copy_tile_geometry(p, &tw, &th, &tb);
-    const Layout layout = layout_of(p);
+namespace {
 
-    // Destination texel (x, y): 2x2 box filter when half-scaled, then nearest row for the Y scale.
+// Encodes the tiles. `Simple`: no scaling (every destination texel is the source texel at the same place), the common
+// copy; otherwise 2x2 box filter when half-scaled, then nearest row for the Y scale.
+template <Layout L, bool Simple>
+void encode_tiles(const EfbCopyParams& p, const uint8_t* rgba, const uint32_t* z, uint8_t* dst, int ow, int oh, int tw, int th,
+                  int tb) {
+    const int n_src = p.half_scale ? 2 : 1;
+    const int shift = p.half_scale ? 2 : 0;  // log2 of the texels averaged
+    const bool y_scaled = p.y_scale && p.y_scale_reg != 0;
+    const int hh = p.half_scale ? std::max(p.h / 2, 1) : p.h;
+
     auto fetch = [&](int x, int y) {
-        int sy = y;
-        if (p.y_scale && p.y_scale_reg != 0) {
-            const int hh = p.half_scale ? std::max(p.h / 2, 1) : p.h;
-            sy = std::min(int((uint64_t(y) * hh) / oh), hh - 1);
-        }
         Texel t{};
-        const int n = p.half_scale ? 2 : 1;
+        if (Simple) {
+            const size_t i = size_t(y) * p.w + x;
+            if (rgba) {
+                t.r = rgba[i * 4]; t.g = rgba[i * 4 + 1]; t.b = rgba[i * 4 + 2]; t.a = rgba[i * 4 + 3];
+            }
+            if (z) t.z = z[i] & 0xFFFFFF;
+            return t;
+        }
+        int sy = y;
+        if (y_scaled) sy = std::min(int((uint64_t(y) * hh) / oh), hh - 1);
         uint32_t sum[4] = {};
-        for (int dy = 0; dy < n; ++dy) {
-            for (int dx = 0; dx < n; ++dx) {
-                const size_t i = size_t(std::min(sy * n + dy, p.h - 1)) * p.w + std::min(x * n + dx, p.w - 1);
+        for (int dy = 0; dy < n_src; ++dy) {
+            for (int dx = 0; dx < n_src; ++dx) {
+                const size_t i = size_t(std::min(sy * n_src + dy, p.h - 1)) * p.w + std::min(x * n_src + dx, p.w - 1);
                 for (int c = 0; c < 4; ++c) sum[c] += rgba ? rgba[i * 4 + c] : 0;
             }
         }
-        const uint32_t cnt = uint32_t(n * n);
-        t.r = uint8_t(sum[0] / cnt); t.g = uint8_t(sum[1] / cnt); t.b = uint8_t(sum[2] / cnt); t.a = uint8_t(sum[3] / cnt);
-        if (z) t.z = z[size_t(std::min(sy * n, p.h - 1)) * p.w + std::min(x * n, p.w - 1)] & 0xFFFFFF;
+        t.r = uint8_t(sum[0] >> shift); t.g = uint8_t(sum[1] >> shift); t.b = uint8_t(sum[2] >> shift); t.a = uint8_t(sum[3] >> shift);
+        if (z) t.z = z[size_t(std::min(sy * n_src, p.h - 1)) * p.w + std::min(x * n_src, p.w - 1)] & 0xFFFFFF;
         return t;
     };
 
@@ -155,38 +163,56 @@ void encode_efb_copy(const EfbCopyParams& p, const uint8_t* rgba, const uint32_t
             uint8_t* tile = dst + size_t(ty) * p.stride + size_t(tx) * tb;
             std::memset(tile, 0, size_t(tb));
             for (int py = 0; py < th; ++py) {
+                const int y = ty * th + py;
+                if (y >= oh) break;
                 for (int px = 0; px < tw; ++px) {
-                    const int x = tx * tw + px, y = ty * th + py;
-                    if (x >= ow || y >= oh) continue;
+                    const int x = tx * tw + px;
+                    if (x >= ow) break;
                     const Texel t = fetch(x, y);
                     const int n = py * tw + px;
-                    switch (layout) {
-                        case Layout::Nibble8x8: {
-                            const uint8_t v = uint8_t(texel_value(p, t) & 0xF);
-                            uint8_t& b = tile[n / 2];
-                            b = (n & 1) ? uint8_t((b & 0xF0) | v) : uint8_t((b & 0x0F) | (v << 4));
-                            break;
-                        }
-                        case Layout::Byte8x4: tile[n] = uint8_t(texel_value(p, t)); break;
-                        case Layout::Word4x4: {
-                            const uint32_t v = texel_value(p, t);
-                            tile[n * 2] = uint8_t(v >> 8);
-                            tile[n * 2 + 1] = uint8_t(v);
-                            break;
-                        }
-                        case Layout::Rgba4x4: {
-                            uint8_t a = t.a, r = t.r, g = t.g, b = t.b;
-                            if (p.depth) { a = 0xFF; r = uint8_t(t.z >> 16); g = uint8_t(t.z >> 8); b = uint8_t(t.z); }
-                            tile[n * 2] = a;
-                            tile[n * 2 + 1] = r;
-                            tile[32 + n * 2] = g;
-                            tile[32 + n * 2 + 1] = b;
-                            break;
-                        }
+                    if constexpr (L == Layout::Nibble8x8) {
+                        const uint8_t v = uint8_t(texel_value(p, t) & 0xF);
+                        uint8_t& b = tile[n / 2];
+                        b = (n & 1) ? uint8_t((b & 0xF0) | v) : uint8_t((b & 0x0F) | (v << 4));
+                    } else if constexpr (L == Layout::Byte8x4) {
+                        tile[n] = uint8_t(texel_value(p, t));
+                    } else if constexpr (L == Layout::Word4x4) {
+                        const uint32_t v = texel_value(p, t);
+                        tile[n * 2] = uint8_t(v >> 8);
+                        tile[n * 2 + 1] = uint8_t(v);
+                    } else {
+                        uint8_t a = t.a, r = t.r, g = t.g, b = t.b;
+                        if (p.depth) { a = 0xFF; r = uint8_t(t.z >> 16); g = uint8_t(t.z >> 8); b = uint8_t(t.z); }
+                        tile[n * 2] = a;
+                        tile[n * 2 + 1] = r;
+                        tile[32 + n * 2] = g;
+                        tile[32 + n * 2 + 1] = b;
                     }
                 }
             }
         }
+    }
+}
+
+template <Layout L>
+void encode_layout(const EfbCopyParams& p, const uint8_t* rgba, const uint32_t* z, uint8_t* dst, int ow, int oh, int tw, int th,
+                   int tb) {
+    const bool simple = !p.half_scale && !(p.y_scale && p.y_scale_reg != 0);
+    if (simple) encode_tiles<L, true>(p, rgba, z, dst, ow, oh, tw, th, tb);
+    else encode_tiles<L, false>(p, rgba, z, dst, ow, oh, tw, th, tb);
+}
+
+}  // namespace
+
+void encode_efb_copy(const EfbCopyParams& p, const uint8_t* rgba, const uint32_t* z, uint8_t* dst) {
+    int ow, oh, tw, th, tb;
+    efb_copy_output_size(p, &ow, &oh);
+    efb_copy_tile_geometry(p, &tw, &th, &tb);
+    switch (layout_of(p)) {
+        case Layout::Nibble8x8: encode_layout<Layout::Nibble8x8>(p, rgba, z, dst, ow, oh, tw, th, tb); break;
+        case Layout::Byte8x4: encode_layout<Layout::Byte8x4>(p, rgba, z, dst, ow, oh, tw, th, tb); break;
+        case Layout::Word4x4: encode_layout<Layout::Word4x4>(p, rgba, z, dst, ow, oh, tw, th, tb); break;
+        case Layout::Rgba4x4: encode_layout<Layout::Rgba4x4>(p, rgba, z, dst, ow, oh, tw, th, tb); break;
     }
 }
 

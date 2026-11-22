@@ -201,6 +201,9 @@ if(BUILD_TESTING)
     add_executable(efb_copy_test tests/efb_copy_test.cpp src/gp/efb_copy.cpp src/gx/gx_texture.cpp)
     target_include_directories(efb_copy_test PRIVATE include src/gp)
     add_test(NAME efb_copy COMMAND efb_copy_test)
+    add_executable(efb_copy_golden_test tests/efb_copy_golden_test.cpp src/gp/efb_copy.cpp src/gx/gx_texture.cpp)
+    target_include_directories(efb_copy_golden_test PRIVATE include src/gp)
+    add_test(NAME efb_copy_golden COMMAND efb_copy_golden_test)
 endif()
 
 # ===========================================================================
