@@ -26,7 +26,41 @@
 #include <unordered_map>
 #include <vector>
 
+#include "gcrecomp/bench.h"
+
+#if defined(__GNUC__) || defined(__clang__)
+#define GCRECOMP_LIKELY(x) __builtin_expect(!!(x), 1)
+#define GCRECOMP_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define GCRECOMP_LIKELY(x) (x)
+#define GCRECOMP_UNLIKELY(x) (x)
+#endif
+// The memory accessors are small inline functions with an out-of-line slow path. Recompiled code is usually built at -O1
+// (compile time), where GCC does not inline small functions on its own: they stay calls, cheaper than before (no
+// per-access hardware-register checks) but still calls. Defining GCRECOMP_FORCE_INLINE_MEMORY for the recompiled code
+// inlines them at every access: about a quarter less CPU in guest-heavy code (the intro movie) for 2.4 times the compile
+// time and twice the binary size (docs/BENCHMARK.md).
+#if (defined(__GNUC__) || defined(__clang__)) && defined(GCRECOMP_FORCE_INLINE_MEMORY)
+#define GCRECOMP_FORCE_INLINE inline __attribute__((always_inline))
+#else
+#define GCRECOMP_FORCE_INLINE inline
+#endif
+
 namespace gcrecomp {
+
+// Byte order of the guest (big endian) against the host: no-ops on a big-endian host.
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+inline uint16_t big16(uint16_t v) { return v; }
+inline uint32_t big32(uint32_t v) { return v; }
+#elif defined(__GNUC__) || defined(__clang__)
+inline uint16_t big16(uint16_t v) { return __builtin_bswap16(v); }
+inline uint32_t big32(uint32_t v) { return __builtin_bswap32(v); }
+#else
+inline uint16_t big16(uint16_t v) { return uint16_t((v << 8) | (v >> 8)); }
+inline uint32_t big32(uint32_t v) {
+    return (v << 24) | ((v & 0xFF00u) << 8) | ((v >> 8) & 0xFF00u) | (v >> 24);
+}
+#endif
 
 // =============================================================================
 // GameConfig - Configuration for game-specific parameters
@@ -262,21 +296,122 @@ struct Memory {
     // True when a store may have touched [addr, addr+len) at or after `clock` (also when the range is not RAM).
     bool written_since(uint32_t addr, uint32_t len, uint32_t clock) const;
 
-    // Big-endian read accessors (match GameCube memory byte order)
-    uint8_t  read8(uint32_t addr) const;
-    uint16_t read16(uint32_t addr) const;
-    uint32_t read32(uint32_t addr) const;
-    uint64_t read64(uint32_t addr) const;
-    float    readf32(uint32_t addr) const;
-    double   readf64(uint32_t addr) const;
+    // Big-endian accessors (match GameCube memory byte order).
+    //
+    // The common case, an address of main RAM through the cached mirror (0x80000000..), is handled inline: count the
+    // operation (the 256K-op interrupt poll, see tick_slow), swap bytes, load or store. Everything else (the uncached
+    // and physical mirrors, hardware registers, the DSP, the write-gather pipe, a watched range, an address outside RAM)
+    // takes the out-of-line *_slow path, which is the general implementation.
+    GCRECOMP_FORCE_INLINE uint8_t read8(uint32_t addr) const {
+        const uint32_t off = addr - MAIN_RAM_BASE;
+        if (GCRECOMP_LIKELY(off < ram_size)) {
+            tick(addr);
+            return ram[off];
+        }
+        return read8_slow(addr);
+    }
+    GCRECOMP_FORCE_INLINE uint16_t read16(uint32_t addr) const {
+        const uint32_t off = addr - MAIN_RAM_BASE;
+        if (GCRECOMP_LIKELY(off < ram_size)) {
+            tick(addr);
+            uint16_t v;
+            std::memcpy(&v, ram + off, 2);
+            return big16(v);
+        }
+        return read16_slow(addr);
+    }
+    GCRECOMP_FORCE_INLINE uint32_t read32(uint32_t addr) const {
+        const uint32_t off = addr - MAIN_RAM_BASE;
+        if (GCRECOMP_LIKELY(off < ram_size)) {
+            tick(addr);
+            uint32_t v;
+            std::memcpy(&v, ram + off, 4);
+            return big32(v);
+        }
+        return read32_slow(addr);
+    }
+    uint64_t read64(uint32_t addr) const { return (uint64_t(read32(addr)) << 32) | read32(addr + 4); }
+    float readf32(uint32_t addr) const {
+        const uint32_t v = read32(addr);
+        float f;
+        std::memcpy(&f, &v, 4);
+        return f;
+    }
+    double readf64(uint32_t addr) const {
+        const uint64_t v = read64(addr);
+        double d;
+        std::memcpy(&d, &v, 8);
+        return d;
+    }
 
-    // Big-endian write accessors
-    void write8(uint32_t addr, uint8_t val);
-    void write16(uint32_t addr, uint16_t val);
-    void write32(uint32_t addr, uint32_t val);
-    void write64(uint32_t addr, uint64_t val);
-    void writef32(uint32_t addr, float val);
-    void writef64(uint32_t addr, double val);
+    GCRECOMP_FORCE_INLINE void write8(uint32_t addr, uint8_t val) {
+        const uint32_t off = addr - MAIN_RAM_BASE;
+        if (GCRECOMP_LIKELY(off < ram_size && watch_count == 0)) {
+            tick(addr);
+            page_stamp[off >> PAGE_SHIFT] = write_clock;
+            ram[off] = val;
+            return;
+        }
+        write8_slow(addr, val);
+    }
+    GCRECOMP_FORCE_INLINE void write16(uint32_t addr, uint16_t val) {
+        const uint32_t off = addr - MAIN_RAM_BASE;
+        if (GCRECOMP_LIKELY(off < ram_size && watch_count == 0)) {
+            tick(addr);
+            page_stamp[off >> PAGE_SHIFT] = write_clock;
+            if (GCRECOMP_UNLIKELY((off & 0xFFF) == 0xFFF)) page_stamp[(off + 1) >> PAGE_SHIFT] = write_clock;
+            const uint16_t v = big16(val);
+            std::memcpy(ram + off, &v, 2);
+            return;
+        }
+        write16_slow(addr, val);
+    }
+    GCRECOMP_FORCE_INLINE void write32(uint32_t addr, uint32_t val) {
+        const uint32_t off = addr - MAIN_RAM_BASE;
+        if (GCRECOMP_LIKELY(off < ram_size && watch_count == 0)) {
+            tick(addr);
+            page_stamp[off >> PAGE_SHIFT] = write_clock;
+            if (GCRECOMP_UNLIKELY((off & 0xFFF) > 0xFFC)) page_stamp[(off + 3) >> PAGE_SHIFT] = write_clock;
+            const uint32_t v = big32(val);
+            std::memcpy(ram + off, &v, 4);
+            return;
+        }
+        write32_slow(addr, val);
+    }
+    void write64(uint32_t addr, uint64_t val) {
+        if (GCRECOMP_LIKELY(addr - MAIN_RAM_BASE < ram_size)) {
+            write32(addr, uint32_t(val >> 32));
+            write32(addr + 4, uint32_t(val));
+            return;
+        }
+        write64_slow(addr, val);
+    }
+    void writef32(uint32_t addr, float val) {
+        uint32_t v;
+        std::memcpy(&v, &val, 4);
+        write32(addr, v);
+    }
+    void writef64(uint32_t addr, double val) {
+        uint64_t v;
+        std::memcpy(&v, &val, 8);
+        write64(addr, v);
+    }
+
+    // The general paths (see above); public only because the inline ones call them.
+    uint8_t read8_slow(uint32_t addr) const;
+    uint16_t read16_slow(uint32_t addr) const;
+    uint32_t read32_slow(uint32_t addr) const;
+    void write8_slow(uint32_t addr, uint8_t val);
+    void write16_slow(uint32_t addr, uint16_t val);
+    void write32_slow(uint32_t addr, uint32_t val);
+    void write64_slow(uint32_t addr, uint64_t val);
+    // Every 256K memory operations (counted by tick, and by translate on the slow path): the heartbeat line, and the
+    // running guest thread takes the interrupts that have come due (alarms, the VI retrace, the DSP and the AI DMA), as a
+    // game spinning on a flag one of their handlers sets never reaches an OS call. Cheap when nothing is due.
+    void tick_slow(uint32_t addr) const;
+    GCRECOMP_FORCE_INLINE void tick(uint32_t addr) const {
+        if (GCRECOMP_UNLIKELY((++bench::g_mem_ops & 0x3FFFF) == 0)) tick_slow(addr);
+    }
 
     // Write watch (GCRECOMP_WATCH=0xADDR:LEN[,0xADDR:LEN...], read by init()): every store that overlaps one of the
     // ranges prints a line with the value and the host call chain (see tools/guest-watch.py). A store costs one
