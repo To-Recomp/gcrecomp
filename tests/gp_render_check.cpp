@@ -34,6 +34,9 @@ static void clear() {
     s.bp[0x4F] = 0; s.bp[0x50] = 0; s.bp[0x51] = 0xFFFFFF;
     CopyRequest r{};
     r.clear = true;
+    r.to_xfb = true;  // a copy to main memory needs the guest RAM, which this check does not have
+    r.w = 640;
+    r.h = 480;
     renderer::copy_efb(r, s);
 }
 
@@ -103,6 +106,67 @@ int main() {
     set_color(1, 0, 0, 1);
     draw();
     expect("orthographic linear fog at z=.5", 128, 128, 0, 255);
+
+    // TEV compare mode (bias field 3): out = d + (a OP b ? c : 0). a = rasterized color, b = konst 0.5 (kcsel 4), c = one.
+    s.bp[0x41] = kUpdate | kCopy;
+    s.bp[0x40] = 0;                               // no depth test
+    s.bp[0xF1] = 0;                               // fog off
+    s.bp[0xF3] = (7 << 16) | (7 << 19);           // alpha test: always
+    const uint32_t ksel0 = s.bp[0xF6];
+    s.bp[0xF6] = ksel0 | (4u << 4) | (4u << 9);   // stage 0: konst color 4/8, konst alpha 4/8
+    const uint32_t kCompare = 3u << 16;
+    const uint32_t cmp_abcd = (10u << 12) | (14u << 8) | (12u << 4) | 15u;  // a RASC, b KONST, c ONE, d ZERO
+    clear();
+    s.bp[0xC0] = kCompare | cmp_abcd;             // R8, greater than
+    set_color(0.8f, 0.2f, 0.2f, 1);
+    draw();
+    expect("compare R8 >, true", 255, 255, 255, 255);
+    set_color(0.3f, 0.9f, 0.9f, 1);
+    draw();
+    expect("compare R8 >, false (only red counts)", 0, 0, 0, 255);
+    s.bp[0xC0] = kCompare | (3u << 20) | cmp_abcd;  // RGB8, greater than
+    set_color(0.8f, 0.2f, 0.9f, 1);
+    draw();
+    expect("compare RGB8 >, per component", 255, 0, 255, 255);
+    s.bp[0xC0] = kCompare | (1u << 20) | cmp_abcd;  // GR16, greater than
+    set_color(0.2f, 0.9f, 0.1f, 1);
+    draw();
+    expect("compare GR16 >, green byte decides", 255, 255, 255, 255);
+    s.bp[0xC0] = kCompare | (1u << 18) | cmp_abcd;  // R8, equal
+    set_color(0.5f, 0.1f, 0.1f, 1);
+    draw();
+    expect("compare R8 ==, true", 255, 255, 255, 255);
+    set_color(0.6f, 0.1f, 0.1f, 1);
+    draw();
+    expect("compare R8 ==, false", 0, 0, 0, 255);
+    // The stage after a compare sees the 0/1 mask: d = rasterized color, minus half the mask (a = ZERO, b = HALF, c = PREV,
+    // subtract bit): the shape the world map uses for its shading. Two stages: mask from 3 = bias, then the subtract.
+    s.bp[0] = (s.bp[0] & ~(0xFu << 10)) | (1u << 10);  // two TEV stages
+    s.bp[0xC0] = kCompare | cmp_abcd;                  // stage 0: mask = (RASC.r > 0.5)
+    s.bp[0xC1] = 7u << 4;                              // stage 0 alpha: d = ZERO (the mask has no alpha here)
+    s.bp[0xC2] = (1u << 18) | (1u << 19) | (15u << 12) | (13u << 8) | (0u << 4) | 10u;  // stage 1: RASC - HALF * PREV, clamped
+    s.bp[0xC3] = 5u << 4;                              // stage 1 alpha: d = RASA
+    set_color(0.8f, 0.8f, 0.8f, 1);
+    draw();
+    expect("mask then RASC - 0.5 * mask", 77, 77, 77, 255);
+    set_color(0.4f, 0.4f, 0.4f, 1);
+    draw();
+    expect("no mask: RASC unchanged", 102, 102, 102, 255);
+    s.bp[0] &= ~(0xFu << 10);
+    s.bp[0xC0] = 10;
+    s.bp[0xC1] = 5 << 4;
+    // alpha compare: a = RASA, b = KONST alpha 0.5, c = KONST alpha 0.5, d = ZERO
+    s.bp[0xC0] = 15;  // color: zero
+    s.bp[0xC1] = (3u << 16) | (5u << 13) | (6u << 10) | (6u << 7) | (7u << 4);
+    set_color(0, 0, 0, 0.8f);
+    draw();
+    expect("alpha compare >, true", 0, 0, 0, 128);
+    set_color(0, 0, 0, 0.2f);
+    draw();
+    expect("alpha compare >, false", 0, 0, 0, 0);
+    s.bp[0xC0] = 10;
+    s.bp[0xC1] = 5 << 4;
+    s.bp[0xF6] = ksel0;
 
     // Z compare location: an alpha-rejected pixel updates depth only with early Z (BP 0x43 bit 6).
     // A is rejected by the alpha test at depth .5; B, green and behind A at depth .75, must then fail the

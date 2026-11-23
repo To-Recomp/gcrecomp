@@ -77,6 +77,7 @@ shot next
 * `tools/guest-stacks.sh PID [DEPTH]`: gdb backtraces of the guest threads of a running harness (guest call chain as `func_XXXXXXXX`).
 * `tools/card-check.py CARD [--files]`: independent validator of a card image (checksums, directory, block map, chains); `docs/GAMEPLAY_FINDINGS.md` records what the game writes.
 * `tools/run-scripted.sh --script A --script B`: segments run in order; `--card-in FILE` starts from a given card image.
+* `tools/input-scripts/tos-load-save.txt` (load a save from the title menu; the save to load is chosen by uncommenting the `NEXT-SAVE` line once per save to skip) and `tos-village-to-field.txt` (from a save in the village of Isélia to the world map; chain them with two `--script` and `--card-in`).
 * `tools/input-scripts/tos-classroom.txt`, `tos-first-walk.txt`, `tos-menu.txt`: the next segments (the classroom cutscene, walking, the field menu; the last one is exploratory).
 * `tools/input-scripts/tos-new-game.txt`: example, Tales of Symphonia from a blank card to the opening classroom scene (the first dialogue).
 * `tools/input-scripts/tos-battle.txt`: Tales of Symphonia from a save (`--card-in`: the memorial circle in Iselia) to a battle on the field map and through it; see docs/BENCHMARK.md ("A battle").
