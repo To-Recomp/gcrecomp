@@ -240,6 +240,9 @@ void FuncTable::call(uint32_t gc_addr, PPCContext* ctx, Memory* mem) const {
             fflush(stdout);
         }
         func(ctx, mem);
+    } else if (RecompiledFunc rel_func = rel_lookup(gc_addr)) {
+        // Code of a REL module the guest linked (docs/REL_MODULES.md).
+        rel_func(ctx, mem);
     } else {
         // Rate-limit unresolved call warnings
         static int unresolved_count = 0;
@@ -248,8 +251,9 @@ void FuncTable::call(uint32_t gc_addr, PPCContext* ctx, Memory* mem) const {
         int& addr_count = seen[gc_addr];
         addr_count++;
         if (addr_count <= 3) {
-            printf("[FuncTable] Unresolved call to 0x%08X (LR=0x%08X)\n",
-                    gc_addr, ctx->lr);
+            const std::string where = rel_describe(gc_addr);
+            printf("[FuncTable] Unresolved call to 0x%08X (LR=0x%08X)%s%s\n",
+                    gc_addr, ctx->lr, where.empty() ? "" : " ", where.c_str());
             fflush(stdout);
         }
         if (unresolved_count == 50 || unresolved_count == 200 ||

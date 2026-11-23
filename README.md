@@ -128,7 +128,7 @@ Paired Singles!), builds a control flow graph, and emits C source files.
 | Feature | Status |
 |---------|--------|
 | DOL parsing (7 text + 11 data sections) | Done |
-| REL parsing (relocatable modules) | Done |
+| REL modules (recompiled to position-independent code, `--rel`, see [docs/REL_MODULES.md](docs/REL_MODULES.md)) | Done |
 | Full Gekko instruction set | Done |
 | Paired Singles SIMD | Done |
 | Control flow graph construction | Done |

@@ -45,6 +45,7 @@ if(GCRECOMP_BUILD_RUNTIME)
         src/runtime/ppc_context.cpp
         src/runtime/memory.cpp
         src/runtime/func_table.cpp
+        src/runtime/rel_modules.cpp
         src/runtime/interrupts.cpp
         src/os/os_funcs.cpp
         src/os/yaz0.cpp
@@ -256,6 +257,7 @@ if(GCRECOMP_BUILD_TOOLS)
         tools/recompiler/ppc_to_c.cpp
         tools/recompiler/symbol_map.cpp
         tools/recompiler/pointer_discovery.cpp
+        tools/recompiler/rel_recomp.cpp
         src/os/rel.cpp
         src/os/yaz0.cpp
     )
@@ -282,7 +284,33 @@ if(GCRECOMP_BUILD_TOOLS)
         add_executable(pointer_discovery_test tests/pointer_discovery_test.cpp)
         target_link_libraries(pointer_discovery_test PRIVATE gcrecomp_tools)
         add_test(NAME pointer_discovery COMMAND pointer_discovery_test)
+        add_executable(rel_recomp_test tests/rel_recomp_test.cpp)
+        target_link_libraries(rel_recomp_test PRIVATE gcrecomp_tools)
+        target_include_directories(rel_recomp_test PRIVATE tests)
+        add_test(NAME rel_recomp COMMAND rel_recomp_test)
         if(GCRECOMP_BUILD_RUNTIME)
+            # REL modules (docs/REL_MODULES.md): a synthetic module is written by rel_synth_gen, recompiled by
+            # gcrecomp_recompiler, and the generated code is linked into a test that plays OSLink at two addresses.
+            set(REL_SYNTH_DIR ${CMAKE_CURRENT_BINARY_DIR}/rel_synth)
+            add_executable(rel_synth_gen tests/rel_synth_gen.cpp)
+            target_include_directories(rel_synth_gen PRIVATE tests)
+            add_custom_command(
+                OUTPUT ${REL_SYNTH_DIR}/synth.rel
+                COMMAND ${CMAKE_COMMAND} -E make_directory ${REL_SYNTH_DIR}
+                COMMAND rel_synth_gen ${REL_SYNTH_DIR}/synth.rel
+                DEPENDS rel_synth_gen tests/rel_synth.h)
+            set(REL_SYNTH_SOURCES
+                ${REL_SYNTH_DIR}/rel_synth_0000.cpp
+                ${REL_SYNTH_DIR}/rel_synth_register.cpp)
+            add_custom_command(
+                OUTPUT ${REL_SYNTH_SOURCES} ${REL_SYNTH_DIR}/rel_synth.h ${REL_SYNTH_DIR}/recomp_common.h
+                COMMAND gcrecomp_recompiler --rel ${REL_SYNTH_DIR}/synth.rel --rel-name synth
+                        --output ${REL_SYNTH_DIR} --project test --funcs-per-file 1000
+                DEPENDS gcrecomp_recompiler ${REL_SYNTH_DIR}/synth.rel)
+            add_executable(rel_module_test tests/rel_module_test.cpp ${REL_SYNTH_SOURCES})
+            target_include_directories(rel_module_test PRIVATE include tests ${REL_SYNTH_DIR})
+            target_link_libraries(rel_module_test PRIVATE gcrecomp_runtime)
+            add_test(NAME rel_module COMMAND rel_module_test)
             # Floating-point / paired-single semantics of the emitted code: the generator runs the emitter at
             # build time, the test compiles and runs the result.
             add_executable(ps_semantics_gen tests/ps_semantics_gen.cpp)

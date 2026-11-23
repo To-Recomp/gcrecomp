@@ -29,6 +29,15 @@ Switches and tools for finding out why a frame looks wrong. Nothing here needs a
 | `GCRECOMP_TRACE_ARGS=ADDR:SPEC[,SPEC..][;ADDR:..]` | When the function at ADDR is entered through the function table (callbacks, pointer calls), prints guest registers (`r3`) or memory words (`r13[-30980]`). `GCRECOMP_TRACE_ARGS_EVERY=N`, `GCRECOMP_TRACE_ARGS_MAX=N` (default 50). |
 | `GCRECOMP_DEBUG_AFTER=S` | The three facilities above stay quiet for the first S seconds of wall-clock time. |
 
+### REL modules
+
+`[REL] module 'X' (id N) linked at 0xADDR: M functions registered` is printed the first time a call reaches a module
+the guest linked. `[FuncTable] Unresolved call to 0xADDR ... inside module 'X' section S +0xOFF` is a call into a
+linked module at an offset that is not a recompiled function entry (each function in the generated `rel_X_*.cpp`
+is headed `// ---- section S +0xOFF ----`, so the offset can be looked up there).
+`... (no recompiled module has this signature)` means the guest linked a REL that was not given to
+`gcrecomp_recompiler --rel`. See docs/REL_MODULES.md.
+
 ## Tools
 
 * `tools/benchmark.py`: frames per second per scene, VI throttling, CPU use and a `perf` profile of a scripted run (docs/BENCHMARK.md).
