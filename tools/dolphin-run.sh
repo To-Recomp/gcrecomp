@@ -91,13 +91,13 @@ fi
 if [ "$headless" = 1 ]; then export QT_QPA_PLATFORM=offscreen; [ -n "$backend" ] || backend=Software; fi
 dolphin_args=(-u "$user" -b)
 [ -z "$backend" ] || dolphin_args+=(-v "$backend")
-dolphin-emu "${dolphin_args[@]}" -e "$iso" > "$user/dolphin.log" 2>&1 &
+# Own session and process group: the cleanup kills that group (the launcher may start a child), never a process found by name.
+setsid dolphin-emu "${dolphin_args[@]}" -e "$iso" > "$user/dolphin.log" 2>&1 &
 dolphin=$!
 cleanup() {
-  kill $dolphin 2>/dev/null; pkill -f "dolphin-emu-x11 -u $user" 2>/dev/null || true
-  wait $dolphin 2>/dev/null || true
+  kill -- "-$dolphin" 2>/dev/null || true
+  wait "$dolphin" 2>/dev/null || true
   if [ "$headless" = 1 ] && [ "$dump_frames" = 0 ]; then
-    pkill -f "dolphin-emu.* -u $user" 2>/dev/null || true
     sleep 2
     rm -rf "$user/Dump/Frames"
   fi
