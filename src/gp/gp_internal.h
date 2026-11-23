@@ -57,6 +57,7 @@ struct CopyRequest {
 // renderer; without it the parser only tracks state and counters.
 extern State g_state;
 extern Stats g_stats;
+extern RenderStats g_render_stats;  // written by the renderer
 extern uint64_t g_frames;
 extern bool g_graphics;
 

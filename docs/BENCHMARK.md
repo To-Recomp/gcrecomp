@@ -19,6 +19,9 @@ stderr (`src/gp/bench.cpp`, `include/gcrecomp/bench.h`). It costs nothing when t
 | `retrace` | VI retraces per second the clock took. 59.94 while the clock is kept (the model is wall clock, see `gcrecomp/vi.h`): it does not drop when the game is slow, the game loses retraces instead. |
 | `dispatch`, `memops` | function-table dispatches (indirect calls, `FuncTable::call`) and guest memory accesses (`Memory::translate`, the unit of the 256K-op interrupt poll) per second: a rough measure of guest work. |
 | `draws`, `verts` | draw calls and vertices submitted in the interval. |
+| `texdec`, `texdec_indexed`, `textexels` | textures decoded and uploaded to the GPU in the interval, of which palette formats (C4, C8, C14X2), and the texels decoded. A texture is decoded again when its guest bytes change (the game rewrote it, an EFB copy landed in it) or, for a palette format, when its palette (TLUT) holds other contents. `GP_TRACE_TEX=1` says which texture and why (docs/DEBUGGING.md). |
+| `texhash`, `texhash_bytes` | uses of a texture that read its guest bytes again to see whether they changed (the page write stamps skip this while nothing stored to the texture's pages), and the bytes read. |
+| `efbmem`, `efbmem_px` | EFB-to-memory copies (read back from the GPU and encoded) and the pixels they read. |
 | `cpu` | CPU time of the whole process over wall time (100% = one core). `threads` lists the threads above 1%: the guest/main thread, the GL driver threads (`gdrv`, `gl`), audio. |
 | `idle` | share of wall time every guest thread was blocked waiting for the retrace or an alarm (`sched::idle_ns`). High: the VI clock throttles the game, the host has CPU to spare. About 0 with `fps` below 60: flat out, the host is the limit. |
 
@@ -48,6 +51,28 @@ pointers, so the profile is flat (self time), which is what is needed here. With
 takes gdb backtraces (poor man's sampling: run it N times and count the innermost frames).
 
 The output directory holds a memory card image: it is deleted unless `--keep`.
+
+## A battle
+
+`tools/input-scripts/tos-battle.txt` loads a save (the memorial circle in Iselia, right after the two opening fights), walks out
+of the village onto the field map, walks in a square until the game loads a battle (a random encounter or a touched enemy symbol)
+and fights with A until the victory. It needs the memory card image with that save (`--card-in`; the harness works on a copy) and
+about 150 s. Its `shot` commands double as markers for the segments, and as screenshots to check that the run really got where it
+should (`battle-hud` shows the HP bars of Lloyd, Colette and Genis):
+
+```
+tools/benchmark.py --bin build/tos_boot --dol extracted/disc1/sys/main.dol --files extracted/disc1/files \
+    --script tools/input-scripts/tos-battle.txt --card-in CARD.raw --seconds 175 --out /var/tmp/bench-battle --keep \
+    --segment load=map/isa_i06 --segment village='cmd:shot village' --segment field='cmd:shot field-start' \
+    --segment battle='cmd:shot battle-start' --segment after='cmd:shot battle-end' --perf battle:15
+```
+
+`--segment NAME=cmd:TEXT` starts a segment when the script runs a command containing TEXT (the `[script] frame N: COMMAND` lines of
+the log), `--segment NAME=SUBSTRING` when the game opens a disc file (as before). `--keep` leaves the screenshots (PPM) in the output
+directory; look at them (`battle-start` is the transition effect, `battle-hud` the fight). The battle is not the same every time:
+which enemies and how many depends on where the party walks and on the game's random numbers, so the draws per second of the
+battle segment differ from run to run (200 000 to 500 000 seen); compare the rates per draw or per frame, and repeat a
+measurement. The world map (field) is locked to 30 fps by the game.
 
 ## Comparing two builds
 

@@ -53,4 +53,17 @@ struct Stats {
 };
 const Stats& stats();
 
+// What the renderer did with the draws (counters only, for GCRECOMP_BENCH and profiling; all zero without graphics).
+struct RenderStats {
+    uint64_t tex_validations = 0;      // texture uses that read the guest bytes again to see whether they changed
+    uint64_t tex_validated_bytes = 0;
+    uint64_t tex_decodes = 0;          // textures decoded and uploaded to the GPU
+    uint64_t tex_decoded_texels = 0;
+    uint64_t tex_indexed_decodes = 0;  // of which palette formats (C4, C8, C14X2)
+    uint64_t efb_copies_memory = 0;    // EFB-to-memory copies (read back and encoded)
+    uint64_t efb_copy_pixels = 0;
+    uint64_t efb_copies_xfb = 0;       // frames presented
+};
+const RenderStats& render_stats();
+
 }  // namespace gcrecomp::gp

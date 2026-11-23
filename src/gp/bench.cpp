@@ -30,6 +30,7 @@ using Clock = std::chrono::steady_clock;
 struct Sample {
     double t = 0;
     uint64_t presented = 0, retraces = 0, dispatch = 0, memops = 0, draws = 0, verts = 0, idle_ns = 0;
+    gp::RenderStats render;
     std::map<std::string, double> cpu;  // CPU seconds per thread name
 };
 
@@ -84,6 +85,7 @@ Sample take(Clock::time_point t0) {
     s.memops = g_mem_ops;
     s.draws = gp::stats().draws;
     s.verts = gp::stats().vertices;
+    s.render = gp::render_stats();
     s.idle_ns = sched::idle_ns();
     s.cpu = thread_cpu();
     return s;
@@ -116,11 +118,19 @@ void report(const Sample& a, const Sample& b) {
     const double idle = double(b.idle_ns - a.idle_ns) * 1e-9;
     std::fprintf(stderr,
                  "[bench] t=%.1f fps=%.2f retrace=%.2f presented=%llu retraces=%llu dispatch=%s/s memops=%s/s draws=%llu verts=%llu "
+                 "texdec=%llu texdec_indexed=%llu textexels=%llu texhash=%llu texhash_bytes=%s efbmem=%llu efbmem_px=%s "
                  "cpu=%.0f%% idle=%.0f%% threads=%s\n",
                  b.t, double(b.presented - a.presented) / dt, double(b.retraces - a.retraces) / dt, (unsigned long long)b.presented,
                  (unsigned long long)b.retraces, human(double(b.dispatch - a.dispatch) / dt).c_str(),
                  human(double(b.memops - a.memops) / dt).c_str(), (unsigned long long)(b.draws - a.draws),
-                 (unsigned long long)(b.verts - a.verts), 100.0 * cpu_total / dt, 100.0 * idle / dt, threads.c_str());
+                 (unsigned long long)(b.verts - a.verts), (unsigned long long)(b.render.tex_decodes - a.render.tex_decodes),
+                 (unsigned long long)(b.render.tex_indexed_decodes - a.render.tex_indexed_decodes),
+                 (unsigned long long)(b.render.tex_decoded_texels - a.render.tex_decoded_texels),
+                 (unsigned long long)(b.render.tex_validations - a.render.tex_validations),
+                 human(double(b.render.tex_validated_bytes - a.render.tex_validated_bytes)).c_str(),
+                 (unsigned long long)(b.render.efb_copies_memory - a.render.efb_copies_memory),
+                 human(double(b.render.efb_copy_pixels - a.render.efb_copy_pixels)).c_str(), 100.0 * cpu_total / dt,
+                 100.0 * idle / dt, threads.c_str());
 }
 
 }  // namespace

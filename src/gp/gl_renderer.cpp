@@ -263,6 +263,7 @@ struct CachedTexture {
     uint64_t hash_frame = 0;
     uint32_t tlut_gen = ~0u, settlut = 0;  // the palette (State::tlut_gen, the TLUT offset register) tlut_hash is of
     uint64_t tlut_hash = 0;
+    uint64_t decoded_data = 0, decoded_tlut = 0;  // data_hash / tlut_hash of the last decode (GP_TRACE_TEX says which one changed)
     SamplerParams params;
     bool params_valid = false;
 };
@@ -341,6 +342,8 @@ GLuint texture_for_map(const State& s, int map) {
     if (always || t.id == 0 || t.clock == 0 || g_frames - t.hash_frame >= kRevalidateFrames ||
         g_mem.written_since(addr, uint32_t(bytes), t.clock)) {
         t.data_hash = hash_bytes(src, bytes);
+        ++g_render_stats.tex_validations;
+        g_render_stats.tex_validated_bytes += bytes;
         t.hash_frame = g_frames;
     }
     t.clock = g_mem.advance_clock();
@@ -364,7 +367,16 @@ GLuint texture_for_map(const State& s, int map) {
             return indexed ? decode_indexed(s.tlut, sizeof(s.tlut), lsrc, lw, lh, fmt, settlut)
                            : gx::decode_texture(lsrc, lw, lh, gx::GXTexFmt(fmt));
         };
+        static const bool trace_tex = std::getenv("GP_TRACE_TEX") != nullptr;
+        if (trace_tex)
+            std::fprintf(stderr, "[TEX] frame %llu decode map=%d addr=%06X fmt=%X %ux%u levels=%u %s data=%08X palette=%08X\n", (unsigned long long)g_frames, map, addr, fmt, w, h,
+                         levels, t.id == 0 ? "new" : t.decoded_data != t.data_hash ? "data changed" : "palette changed", unsigned(t.data_hash), unsigned(t.tlut_hash));
+        t.decoded_data = t.data_hash;
+        t.decoded_tlut = t.tlut_hash;
         const std::vector<uint8_t> rgba = decode_level(0);
+        ++g_render_stats.tex_decodes;
+        g_render_stats.tex_decoded_texels += size_t(w) * h;
+        if (indexed) ++g_render_stats.tex_indexed_decodes;
         if (const char* dir = std::getenv("GP_DUMP_TEX")) {
             // GP_DUMP_TEX_MAX: how many textures to write (default 24); GP_DUMP_TEX_AFTER: only once this many
             // frames have been presented (skips the textures of earlier scenes, such as a movie).
@@ -993,6 +1005,8 @@ static void copy_efb_to_memory(const State& s, uint32_t copy_cmd) {
     p.h = std::min(p.h, kEfbHeight - p.y);
     const uint32_t addr = (s.bp[0x4B] & 0xFFFFFF) << 5;
     if (p.w <= 0 || p.h <= 0) return;
+    ++g_render_stats.efb_copies_memory;
+    g_render_stats.efb_copy_pixels += size_t(p.w) * p.h;
     if (uint64_t(addr) + efb_copy_extent(p) > g_mem.ram_size) {
         std::fprintf(stderr, "[GL] EFB copy to 0x%06X (+%zu) is outside RAM, ignored\n", addr, efb_copy_extent(p));
         return;
@@ -1034,6 +1048,7 @@ void copy_efb(const CopyRequest& r, const State& s) {
     }
     if (r.to_xfb) {
         static uint64_t presented = 0;
+        ++g_render_stats.efb_copies_xfb;
         if (++presented % 600 == 0 && gp_trace) print_feature_use();
         // Blit the copied EFB region to the window and present.
         glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);

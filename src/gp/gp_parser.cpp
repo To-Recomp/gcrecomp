@@ -26,6 +26,7 @@ float State::xf_float(uint32_t addr) const {
 }
 
 Stats g_stats;
+RenderStats g_render_stats;
 State g_state;
 uint64_t g_frames = 0;
 std::atomic<long> g_trace_request{-1};  // request_trace_frame(): the frame to trace, overrides GP_TRACE_FRAME
@@ -760,5 +761,6 @@ void wgp_write(uint32_t size, uint64_t value) {
 uint64_t frames_presented() { return g_frames; }
 void request_trace_frame(uint64_t n) { g_trace_request = long(g_frames + (n ? n - 1 : 0)); }
 const Stats& stats() { return g_stats; }
+const RenderStats& render_stats() { return g_render_stats; }
 
 }  // namespace gcrecomp::gp

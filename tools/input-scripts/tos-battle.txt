@@ -1,0 +1,49 @@
+# Tales of Symphonia (GQSF, PAL French): a battle, for tools/benchmark.py. Inputs only, no game data.
+#
+# Needs a memory card image holding the save made at the memorial circle in Iselia (the latest of two saves, right after
+# the two intro battles): give it with tools/run-scripted.sh --card-in or tools/benchmark.py --card-in; the script never
+# writes to it, but the game may (the harness works on a copy). Slot A of the card.
+#
+# Flow: boot, skip the intro movie, title menu 'Charger partie' -> slot A -> the second save -> 'Oui', Lloyd stands on the
+# save point in the village; walk up through the arch to the exit ('Sortir', A), arrive on the field map (FR_m_top2field.rel,
+# where enemy symbols walk about), then walk in a square until the game loads the battle (BTL/BTLlloyd.cab is opened by the
+# battle's load; the field is random: a skull symbol touched or a random encounter) and fight with A (attack) until the
+# victory music s/bgm_b010.song is opened (BTL/BTLwin.bfp only the first time), or 90 s. About 150 s of wall time in all
+# (harness argument `seconds`: 170).
+#
+# The 'shot' lines are screenshots to look at (the battle HUD with the HP bars of Lloyd, Colette and Genis must be on
+# 'battle-hud') and, at the same time, the markers tools/benchmark.py cuts the run at:
+#   tools/benchmark.py ... --script tools/input-scripts/tos-battle.txt --card-in CARD.raw \
+#       --segment load=map/isa_i06 --segment village=cmd:shot village --segment field=cmd:shot field-start \
+#       --segment battle=cmd:shot battle-start --segment after=cmd:shot battle-end
+wait-file mov/op.h4m timeout=120
+press S                                           # START skips the opening movie
+wait-file title.tpl timeout=30
+wait 500
+press D; wait 30                                  # Nouvelle partie / Charger partie / Continuer: the second entry
+press A; wait 150                                 # 'Charger'
+press A; wait 100                                 # slot A: the list of saves
+press D; wait 30                                  # the second save (0:07 of play time)
+press A; wait 100                                 # 'Charger donnees de jeu depuis la carte memoire?'
+shot load-confirm
+press A                                           # Oui
+wait-file map/isa_i06 timeout=60                  # the village loads
+wait 400
+shot village
+stick up hold=150; wait 150                       # to the arch at the north end of the village
+stick up+right hold=150; wait 150
+stick up hold=150; wait 150
+stick up hold=150; wait 150                       # 'Sortir' is offered
+shot village-exit
+press A                                           # leave for the field
+wait-file FR_m_top2field.rel timeout=30
+wait 240
+shot field-start
+stick-until-file BTL/BTLlloyd.cab down left down right every=300 timeout=240   # walk in a square until a battle starts
+shot battle-start
+wait 400
+shot battle-hud
+press-until-file s/bgm_b010.song A every=15 hold=5 timeout=90                   # attack until the victory music starts
+shot battle-end
+wait 300
+shot battle-won

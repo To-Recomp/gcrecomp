@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace gcrecomp::gp::input {
@@ -35,7 +36,7 @@ struct Observation {
     std::vector<std::string> files;         // disc files opened since the previous step, in order
 };
 
-enum class CmdKind { At, Press, Wait, WaitSeconds, WaitPresented, WaitFile, WaitChange, WaitStill, Shot, PressUntilFile, TraceFrame, Stick };
+enum class CmdKind { At, Press, Wait, WaitSeconds, WaitPresented, WaitFile, WaitChange, WaitStill, Shot, PressUntilFile, TraceFrame, Stick, StickUntilFile };
 
 struct Command {
     CmdKind kind = CmdKind::Wait;
@@ -43,8 +44,9 @@ struct Command {
     int8_t sx = 0, sy = 0;   // Stick: deflection (SDK units, -128..127, y up)
     bool sub = false;        // Stick: the C-stick instead of the main stick
     std::vector<uint16_t> cycle;  // PressUntilFile: the presses, used in turn
-    int count = 0;           // At: frame; Press: hold frames; Wait*/WaitStill: how many
-    int every = 120;         // PressUntilFile: frames between presses
+    std::vector<std::pair<int8_t, int8_t>> stick_cycle;  // StickUntilFile: the deflections (x, y), used in turn
+    int count = 0;           // At: frame; Press / PressUntilFile / StickUntilFile: hold frames; Wait*/WaitStill: how many
+    int every = 120;         // PressUntilFile / StickUntilFile: frames between presses
     double seconds = 0;      // WaitSeconds: duration
     double threshold = 0.05; // WaitChange / WaitStill: signature difference that counts as a change
     double timeout = 0;      // seconds of wall time after which a wait gives up (0 = never)

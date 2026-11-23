@@ -203,6 +203,17 @@ bool parse_command(const std::vector<std::string>& w, const std::string& src, st
         }
         if (!have_hold) c.count = 10;
         if (c.count < 1 || c.every < 1) return fail("hold and every must be at least 1 frame");
+    } else if (verb == "stick-until-file") {
+        c.kind = CmdKind::StickUntilFile;
+        if (args.size() < 2) return fail("stick-until-file takes a path substring and stick directions, used in turn (stick-until-file BTL/BTLlloyd.cab down left every=240)");
+        c.text = lower(args[0]);
+        for (size_t i = 1; i < args.size(); ++i) {
+            int x = 0, y = 0;
+            if (!parse_direction(args[i], x, y)) return fail("unknown stick direction '" + args[i] + "' (up, down, left, right joined by '+')");
+            c.stick_cycle.push_back({int8_t(x), int8_t(y)});
+        }
+        if (!have_hold) c.count = c.every;  // walks continuously unless told otherwise
+        if (c.count < 1 || c.every < 1) return fail("hold and every must be at least 1 frame");
     } else if (verb == "at") {
         c.kind = CmdKind::At;
         if (!need_args(1) || !number_arg(v)) return fail("at takes a frame number");
@@ -336,6 +347,7 @@ uint16_t Script::step(const Observation& o) {
             case CmdKind::WaitSeconds: done = o.seconds - start_seconds_ >= c.seconds; break;
             case CmdKind::WaitPresented: done = o.presented - start_presented_ >= uint64_t(c.count); break;
             case CmdKind::PressUntilFile:
+            case CmdKind::StickUntilFile:
             case CmdKind::WaitFile: {
                 done = false;
                 for (; file_cursor_ < o.files.size(); ++file_cursor_)
@@ -348,6 +360,19 @@ uint16_t Script::step(const Observation& o) {
                     holds_.push_back({c.cycle[cycle_pos_], o.frame + c.count});
                     cycle_pos_ = (cycle_pos_ + 1) % c.cycle.size();
                     next_press_ = o.frame + c.every;
+                }
+                if (c.kind == CmdKind::StickUntilFile) {
+                    if (done) {  // arrived: let go of the stick
+                        for (size_t i = 0; i < holds_.size();) {
+                            if (holds_[i].stick && !holds_[i].sub) holds_.erase(holds_.begin() + long(i));
+                            else ++i;
+                        }
+                    } else if (o.frame >= next_press_) {
+                        const auto& d = c.stick_cycle[cycle_pos_];
+                        holds_.push_back({0, o.frame + c.count, d.first, d.second, true, false});
+                        cycle_pos_ = (cycle_pos_ + 1) % c.stick_cycle.size();
+                        next_press_ = o.frame + c.every;
+                    }
                 }
                 break;
             }
