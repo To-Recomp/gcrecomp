@@ -1,0 +1,24 @@
+# Tales of Symphonia (GQSF, PAL French): load a save from the title menu. Inputs only, no game data.
+#
+# Needs a memory card image holding saves (tools/run-scripted.sh --card-in CARD.raw; the harness works on a copy). Slot A
+# of the card. The script ends when the game has loaded the save: the scene of the save is on screen ('loaded' is its
+# screenshot). Chain a segment after it (--script this --script other).
+#
+# Which save: the list shows the saves in the order of the card. The commented line `press D; wait 30` below moves the
+# cursor one save down: uncomment it (repeat it) once per save to skip; none loads the first save of the list.
+#
+# Flow: boot, skip the intro movie, title 'Charger partie' -> slot A -> the save -> 'Oui' -> wait for the scene.
+wait-file mov/op.h4m timeout=120
+press S                                           # START skips the opening movie
+wait-file title.tpl timeout=30
+wait 500
+press D; wait 30                                  # Nouvelle partie / Charger partie / Continuer: the second entry
+press A; wait 150                                 # 'Charger'
+press A; wait 100                                 # slot A: the list of saves
+# press D; wait 30                                # NEXT-SAVE: uncomment once per save to skip
+press A; wait 100                                 # 'Charger donnees de jeu depuis la carte memoire?'
+shot load-confirm
+press A                                           # Oui
+wait-file d.d timeout=120                          # the scene of the save loads (the field/village archive)
+wait 900
+shot loaded

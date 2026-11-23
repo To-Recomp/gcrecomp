@@ -5,13 +5,20 @@
 # named-pipe controller, and take screenshots: for comparing saves, memory cards, frames and audio with the recomp.
 #
 # Usage: tools/dolphin-run.sh --iso <disc> [--card <raw> | --gci <save.gci>] [--user <dir>] -- <step>...
-# Steps run in order: wait:<seconds>  press:<A|B|X|Y|Z|START|L|R|D_UP|D_DOWN|D_LEFT|D_RIGHT>  mash:<button>:<seconds>  shot:<file.png>
+# Steps run in order: wait:<seconds>  press:<A|B|X|Y|Z|START|L|R|D_UP|D_DOWN|D_LEFT|D_RIGHT>  mash:<button>:<seconds>  stick:<dir>[+<dir>][:<seconds>]  shot:<file.png>
 # --card <raw>: raw image as slot A (Dolphin may write to it: pass a copy). --gci <file>: a GCI-folder card holding that one save.
 # --dump-audio: Dolphin writes its audio to <user>/Dump/Audio/*dspdump.wav (compare with GCRECOMP_DUMP_AUDIO using tools/wav-compare.py).
 # --dump-frames: Dolphin writes the video to <user>/Dump/Frames/*.avi (extract frames with ffmpeg to see what was on screen).
+# --no-audio: no audio output (the game's sound is not played on the speakers).
+# --headless: no window and no X server needed (Qt's offscreen platform; the Software renderer unless --backend says
+#   another: OGL, Vulkan, Software, Null); the video is dumped as PNG frames and `shot:<file.png>` copies the newest dumped
+#   frame instead of taking a desktop screenshot (no spectacle needed). The frames are deleted at the end unless
+#   --dump-frames is also given. Runs in the background without disturbing the desktop.
+# --iso takes an image; tools/gcm-from-dir.py rebuilds one from an extracted disc directory (Dolphin's folder boot does not
+#   accept the extractor's layout).
 # Needs dolphin-emu, spectacle (KDE) and ImageMagick for the screenshots. Linux only.
 set -euo pipefail
-iso=""; card=""; gci=""; user="/tmp/dolphin-run-user"; dump_audio=0; dump_frames=0
+iso=""; card=""; gci=""; user="/tmp/dolphin-run-user"; dump_audio=0; dump_frames=0; mute=0; headless=0; backend=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --iso) iso="$2"; shift 2 ;;
@@ -20,6 +27,9 @@ while [ $# -gt 0 ]; do
     --user) user="$2"; shift 2 ;;
     --dump-audio) dump_audio=1; shift ;;
     --dump-frames) dump_frames=1; shift ;;
+    --no-audio) mute=1; shift ;;
+    --headless) headless=1; shift ;;
+    --backend) backend="$2"; shift 2 ;;
     --) shift; break ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
@@ -44,6 +54,7 @@ SlotB = 255
 $([ -n "$card" ] && echo "MemcardAPath = $card")
 [DSP]
 DumpAudio = $([ "$dump_audio" = 1 ] && echo True || echo False)
+$([ "$mute" = 1 ] && echo "Backend = No Audio Output")
 [Interface]
 ConfirmStop = False
 EOF
@@ -73,21 +84,44 @@ Main Stick/Right = `Axis X +`
 EOF
 mkfifo "$user/Pipes/pad"
 
-dolphin-emu -u "$user" -b -e "$iso" > "$user/dolphin.log" 2>&1 &
+# headless: dump the frames (shots copy the newest one)
+if [ "$headless" = 1 ] && [ "$dump_frames" = 0 ]; then
+  printf '[Movie]\nDumpFrames = True\nDumpFramesSilent = True\n' >> "$user/Config/Dolphin.ini"
+fi
+if [ "$headless" = 1 ]; then export QT_QPA_PLATFORM=offscreen; [ -n "$backend" ] || backend=Software; fi
+dolphin_args=(-u "$user" -b)
+[ -z "$backend" ] || dolphin_args+=(-v "$backend")
+dolphin-emu "${dolphin_args[@]}" -e "$iso" > "$user/dolphin.log" 2>&1 &
 dolphin=$!
-trap 'kill $dolphin 2>/dev/null; pkill -f "dolphin-emu-x11 -u $user" 2>/dev/null || true' EXIT
+cleanup() {
+  kill $dolphin 2>/dev/null; pkill -f "dolphin-emu-x11 -u $user" 2>/dev/null || true
+  wait $dolphin 2>/dev/null || true
+  if [ "$headless" = 1 ] && [ "$dump_frames" = 0 ]; then
+    pkill -f "dolphin-emu.* -u $user" 2>/dev/null || true
+    sleep 2
+    rm -rf "$user/Dump/Frames"
+  fi
+}
+trap cleanup EXIT
 exec 3<>"$user/Pipes/pad"
 for step in "$@"; do
   case "$step" in
     wait:*) sleep "${step#wait:}" ;;
     press:*) echo "PRESS ${step#press:}" >&3; sleep 0.3; echo "RELEASE ${step#press:}" >&3 ;;
     stick:*)
-      # tilt the main stick: stick:left|right|up|down (menus often read the stick, not the D-pad)
-      case "${step#stick:}" in
-        left) xy="0 0.5" ;; right) xy="1 0.5" ;; up) xy="0.5 1" ;; down) xy="0.5 0" ;;
-        *) echo "unknown stick direction ${step#stick:}" >&2; exit 2 ;;
-      esac
-      echo "SET MAIN $xy" >&3; sleep 0.4; echo "SET MAIN 0.5 0.5" >&3 ;;
+      # tilt the main stick: stick:DIR[+DIR...][:SECONDS] with DIR in left|right|up|down (menus often read the stick,
+      # not the D-pad); held 0.4 s unless SECONDS is given: stick:up+right:2.5 walks 2.5 s
+      spec="${step#stick:}"; secs=0.4
+      case "$spec" in *:*) secs="${spec#*:}"; spec="${spec%%:*}" ;; esac
+      x=0.5; y=0.5
+      IFS=+ read -ra dirs <<< "$spec"
+      for d in "${dirs[@]}"; do
+        case "$d" in
+          left) x=0 ;; right) x=1 ;; up) y=1 ;; down) y=0 ;;
+          *) echo "unknown stick direction $d" >&2; exit 2 ;;
+        esac
+      done
+      echo "SET MAIN $x $y" >&3; sleep "$secs"; echo "SET MAIN 0.5 0.5" >&3 ;;
     mash:*)
       # press a button every 1.5 s for the given time: gets through screens whose timing varies
       IFS=: read -r _ btn secs <<< "$step"
@@ -95,7 +129,14 @@ for step in "$@"; do
       while [ "$SECONDS" -lt "$end" ]; do
         echo "PRESS $btn" >&3; sleep 0.3; echo "RELEASE $btn" >&3; sleep 1.2
       done ;;
-    shot:*) spectacle -b -n -f -o "${step#shot:}" > /dev/null 2>&1 ;;
+    shot:*)
+      if [ "$headless" = 1 ]; then
+        # the newest dumped frame (the file being written is the highest number: take the one before it)
+        newest=$(ls "$user/Dump/Frames" | sed 's/[^0-9]//g' | sort -n | tail -2 | head -1)
+        cp "$user/Dump/Frames/framedump_$newest.png" "${step#shot:}"
+      else
+        spectacle -b -n -f -o "${step#shot:}" > /dev/null 2>&1
+      fi ;;
     *) echo "unknown step $step" >&2; exit 2 ;;
   esac
 done

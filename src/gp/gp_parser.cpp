@@ -7,6 +7,7 @@
 // documentation of the same hardware. No Dolphin code is used.
 #include "gcrecomp/gp/gp.h"
 
+#include <algorithm>
 #include <cmath>
 #include <atomic>
 #include <cstdio>
@@ -474,8 +475,8 @@ private:
         for (int i = 0; i < 8; ++i)
             std::fprintf(stderr, "[STATE] texgen%d info=%05X  map%d mode0=%06X img0=%06X img3=%06X\n", i, s.xf[0x1040 + i], i, s.bp[0x80 + (i < 4 ? i : i + 0x1C)],
                          s.bp[0x88 + (i < 4 ? i : i + 0x1C)], s.bp[0x94 + (i < 4 ? i : i + 0x1C)]);
-        std::fprintf(stderr, "[STATE] fog=%06X/%06X/%06X/%06X ind=%06X genmode_ind=%u\n", s.bp[0xEE], s.bp[0xEF], s.bp[0xF0], s.bp[0xF1], s.bp[0x10],
-                     (s.bp[0] >> 16) & 7);
+        std::fprintf(stderr, "[STATE] fog=%06X/%06X/%06X/%06X colour=%06X range=%06X/%06X ind=%06X genmode_ind=%u\n", s.bp[0xEE], s.bp[0xEF], s.bp[0xF0], s.bp[0xF1],
+                     s.bp[0xF2], s.bp[0xE8], s.bp[0xE9], s.bp[0x10], (s.bp[0] >> 16) & 7);
     }
 
     void draw(Primitive prim, uint32_t count, const Layout& l, const uint8_t* data) {
@@ -501,6 +502,15 @@ private:
         const uint32_t num_texgens = s.bp[0x00] & 0xF;
         const bool trace = tracing_frame();
         static int trace_n = 0;
+        // Several frames can be traced one after the other (the script command `trace-frame` repeated): the draws are
+        // numbered from 1 in each, and trace_ordinal counts the traced frames (0 for the first).
+        static uint64_t trace_last_frame = ~uint64_t(0);
+        static int trace_ordinal = -1;
+        if (trace && g_frames != trace_last_frame) {
+            trace_last_frame = g_frames;
+            ++trace_ordinal;
+            trace_n = 0;
+        }
         if (trace) {
             ++trace_n;
             // GP_TRACE_STATE=n[,m...]: full TEV / texture / raster state at those draws of the traced frame.
@@ -694,12 +704,29 @@ private:
                                  s.xf_float(tm + 5), s.xf_float(tm + 6), s.xf_float(tm + 7));
             }
         }
-        // GP_TRACE_DRAWS=first-last: in the traced frame, only draws numbered first..last (as printed) are rendered, to see
-        // what a group of draws contributes.
+        // GP_TRACE_DRAWS=first-last[,first-last...]: in the traced frame, only draws numbered first..last (as printed) are
+        // rendered, to see what a group of draws contributes. With several ranges, the k-th traced frame (script command
+        // `trace-frame` repeated, one `shot` after each) renders the k-th range: one run shows several groups of draws.
         if (trace) {
-            static unsigned lo = 0, hi = ~0u;
-            static const bool have_range = std::getenv("GP_TRACE_DRAWS") && std::sscanf(std::getenv("GP_TRACE_DRAWS"), "%u-%u", &lo, &hi) == 2;
-            if (have_range && (unsigned(trace_n) < lo || unsigned(trace_n) > hi)) return;
+            struct Range { unsigned lo, hi; };
+            static const std::vector<Range> ranges = [] {
+                std::vector<Range> v;
+                if (const char* e = std::getenv("GP_TRACE_DRAWS")) {
+                    for (const char* q = e; *q;) {
+                        Range r;
+                        int used = 0;
+                        if (std::sscanf(q, "%u-%u%n", &r.lo, &r.hi, &used) != 2) break;
+                        v.push_back(r);
+                        q += used;
+                        if (*q == ',') ++q;
+                    }
+                }
+                return v;
+            }();
+            if (!ranges.empty()) {
+                const Range& r = ranges[std::min(size_t(trace_ordinal), ranges.size() - 1)];
+                if (unsigned(trace_n) < r.lo || unsigned(trace_n) > r.hi) return;
+            }
         }
         DrawCall call{prim, count, vertices_.data()};
         renderer::draw(call, g_state);

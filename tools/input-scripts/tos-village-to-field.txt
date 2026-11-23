@@ -1,0 +1,33 @@
+# Tales of Symphonia (GQSF, PAL French): from a save made in the village of Iselia (right after the two intro battles,
+# Lloyd, Genis and Colette in front of the temple arch) to the field map (the world map: FR_m_top2field.rel). Inputs
+# only, no game data. Chain after tos-load-save.txt (the save loads there; the village is at the save point):
+#   tools/run-scripted.sh ... --card-in CARD.raw --script tools/input-scripts/tos-load-save.txt \
+#       --script tools/input-scripts/tos-village-to-field.txt
+# Skips the dialogue, backs out of the save menu, walks to the arch at the north end of the village, fights the skull
+# monster (A), walks through the arch and takes the screenshots 'field' (just arrived) and 'field-walk' (after a step back). Timing varies from run to run: look at the shots.
+press A; wait 90                                  # the dialogue of the save (Genis: 'Alors pourquoi...')
+shot dialogue
+press B; wait 60                                  # the game then offers its save menu: B backs out of it
+press B; wait 60
+press B; wait 60
+press B; wait 60
+press B; wait 60
+shot dialog-end                                   # Lloyd stands on the save point, 'Sauvegarder' is offered
+stick up hold=150; wait 150                       # to the arch at the north end of the village (as tos-battle.txt)
+stick up+right hold=150; wait 150
+stick up hold=150; wait 150
+stick up hold=150; wait 150                       # 'Sortir' is offered
+shot village-exit                                 # an event starts here: a skull symbol, a dialogue, a fight
+press-until-file s/bgm_b010.song A every=15 hold=5 timeout=150   # A skips the dialogue and attacks until the victory music
+wait 200
+shot battle-won
+press A; wait 90                                  # the dialogue after the fight
+press A; wait 90
+press A; wait 90
+press A; wait 90
+shot after-event
+stick-until-file FR_m_top2field.rel up+right up every=100 timeout=90   # through the arch: 'Sortir' leaves the village
+wait 300
+shot field                                        # the world map (Isélia and its 'Entrer / Partir' prompt)
+stick down hold=120; wait 120
+shot field-walk

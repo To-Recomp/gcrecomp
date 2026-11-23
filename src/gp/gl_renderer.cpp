@@ -51,7 +51,7 @@ bool g_efb_bound = false;  // GL_FRAMEBUFFER is the EFB framebuffer (draw() bind
 uint64_t g_indirect_draws = 0;
 // How often the game used the features that are only visible on screen, reported at shutdown.
 struct FeatureUse {
-    uint64_t c14x2_textures = 0, mip_textures = 0, fog_draws = 0, const_alpha_draws = 0, logic_op_draws = 0, early_z_passes = 0;
+    uint64_t c14x2_textures = 0, mip_textures = 0, fog_draws = 0, const_alpha_draws = 0, logic_op_draws = 0, early_z_passes = 0, tev_compare_draws = 0;
 } g_use;
 
 const char* kVertexShader = R"(#version 330 core
@@ -171,6 +171,32 @@ float fog_amount() {
     return f;
 }
 
+// TEV compare mode (bias field 3): out = d + (a OP b ? c : 0) instead of the linear blend. OP is > (sub bit 0) or ==
+// (sub bit 1); the scale field picks what is compared: 0 the red byte (R8), 1 green:red as 16 bits (GR16), 2 blue:green:red
+// as 24 bits (BGR24), 3 each component alone (RGB8). Bytes are the inputs rounded to 8 bits.
+vec3 tev_compare_color(vec3 a, vec3 b, vec3 c, vec3 d, uint mode, bool eq) {
+    ivec3 ia = ivec3(floor(clamp(a, 0.0, 1.0) * 255.0 + 0.5));
+    ivec3 ib = ivec3(floor(clamp(b, 0.0, 1.0) * 255.0 + 0.5));
+    bvec3 hit;
+    if (mode == 3u) {
+        hit = eq ? equal(ia, ib) : greaterThan(ia, ib);
+    } else {
+        int va, vb;
+        if (mode == 0u) { va = ia.r; vb = ib.r; }
+        else if (mode == 1u) { va = ia.g * 256 + ia.r; vb = ib.g * 256 + ib.r; }
+        else { va = (ia.b * 256 + ia.g) * 256 + ia.r; vb = (ib.b * 256 + ib.g) * 256 + ib.r; }
+        hit = bvec3(eq ? va == vb : va > vb);
+    }
+    return d + vec3(hit.x ? c.x : 0.0, hit.y ? c.y : 0.0, hit.z ? c.z : 0.0);
+}
+
+// The alpha environment has one value per input: every mode compares the alpha bytes (the multi-byte modes of the
+// colour environment have no extra channels to read).
+float tev_compare_alpha(float a, float b, float c, float d, bool eq) {
+    int ia = int(floor(clamp(a, 0.0, 1.0) * 255.0 + 0.5)), ib = int(floor(clamp(b, 0.0, 1.0) * 255.0 + 0.5));
+    return d + ((eq ? ia == ib : ia > ib) ? c : 0.0);
+}
+
 void main() {
     vec4 reg[4] = vec4[4](u_reg[0], u_reg[1], u_reg[2], u_reg[3]);
     for (int i = 0; i < u_nstages; ++i) {
@@ -203,13 +229,17 @@ void main() {
         float bias_c[4] = float[4](0.0, 0.5, -0.5, 0.0);
         float scale[4] = float[4](1.0, 2.0, 4.0, 0.5);
         float sign_c = ((ce >> 18) & 1u) != 0u ? -1.0 : 1.0;
-        vec3 color = (cd + sign_c * mix(ca, cb, cc) + bias_c[(ce >> 16) & 3u]) * scale[(ce >> 20) & 3u];
+        vec3 color = ((ce >> 16) & 3u) == 3u
+            ? tev_compare_color(ca, cb, cc, cd, (ce >> 20) & 3u, ((ce >> 18) & 1u) != 0u)
+            : (cd + sign_c * mix(ca, cb, cc) + bias_c[(ce >> 16) & 3u]) * scale[(ce >> 20) & 3u];
         if (((ce >> 19) & 1u) != 0u) color = clamp(color, 0.0, 1.0);
 
         float ain[8] = float[8](reg[0].a, reg[1].a, reg[2].a, reg[3].a, tex.a, ras.a, ka, 0.0);
         float aa = ain[(ae >> 13) & 7u], ab = ain[(ae >> 10) & 7u], ac = ain[(ae >> 7) & 7u], ad = ain[(ae >> 4) & 7u];
         float sign_a = ((ae >> 18) & 1u) != 0u ? -1.0 : 1.0;
-        float alpha = (ad + sign_a * mix(aa, ab, ac) + bias_c[(ae >> 16) & 3u]) * scale[(ae >> 20) & 3u];
+        float alpha = ((ae >> 16) & 3u) == 3u
+            ? tev_compare_alpha(aa, ab, ac, ad, ((ae >> 18) & 1u) != 0u)
+            : (ad + sign_a * mix(aa, ab, ac) + bias_c[(ae >> 16) & 3u]) * scale[(ae >> 20) & 3u];
         if (((ae >> 19) & 1u) != 0u) alpha = clamp(alpha, 0.0, 1.0);
 
         uint cdest = (ce >> 22) & 3u, adest = (ae >> 22) & 3u;
@@ -651,6 +681,12 @@ void apply_state(const State& s) {
         stage[i][2] = map | (coord << 3) | (enable << 6) | (chan << 7);
         stage[i][3] = kc | (ka << 5);
     }
+    for (int i = 0; i < nstages; ++i) {
+        if (((stage[i][0] >> 16) & 3) == 3 || ((stage[i][1] >> 16) & 3) == 3) {
+            ++g_use.tev_compare_draws;
+            break;
+        }
+    }
     if (g_sh.nstages.changed(&nstages)) glUniform1i(g_loc.nstages, nstages);
     if (g_sh.stage.changed(stage)) glUniform4uiv(g_loc.stage, 16, &stage[0][0]);
 
@@ -691,9 +727,9 @@ void apply_state(const State& s) {
 }
 
 void print_feature_use() {
-    std::fprintf(stderr, "[GL] feature use: C14X2 textures %llu, mipmapped textures %llu, fog draws %llu, constant-alpha draws %llu, logic-op draws %llu, early-Z passes %llu\n",
+    std::fprintf(stderr, "[GL] feature use: C14X2 textures %llu, mipmapped textures %llu, fog draws %llu, constant-alpha draws %llu, logic-op draws %llu, early-Z passes %llu, TEV compare-mode draws %llu\n",
                  (unsigned long long)g_use.c14x2_textures, (unsigned long long)g_use.mip_textures, (unsigned long long)g_use.fog_draws,
-                 (unsigned long long)g_use.const_alpha_draws, (unsigned long long)g_use.logic_op_draws, (unsigned long long)g_use.early_z_passes);
+                 (unsigned long long)g_use.const_alpha_draws, (unsigned long long)g_use.logic_op_draws, (unsigned long long)g_use.early_z_passes, (unsigned long long)g_use.tev_compare_draws);
     if (g_indirect_draws) std::fprintf(stderr, "[GL] %llu draw(s) used indirect texturing (not implemented)\n", (unsigned long long)g_indirect_draws);
 }
 
