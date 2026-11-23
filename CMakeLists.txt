@@ -255,6 +255,7 @@ if(GCRECOMP_BUILD_TOOLS)
         tools/recompiler/cfg_builder.cpp
         tools/recompiler/ppc_to_c.cpp
         tools/recompiler/symbol_map.cpp
+        tools/recompiler/pointer_discovery.cpp
         src/os/rel.cpp
         src/os/yaz0.cpp
     )
@@ -278,6 +279,9 @@ if(GCRECOMP_BUILD_TOOLS)
         add_executable(recompiler_rc_test tests/recompiler_rc_test.cpp)
         target_link_libraries(recompiler_rc_test PRIVATE gcrecomp_tools)
         add_test(NAME recompiler_rc COMMAND recompiler_rc_test)
+        add_executable(pointer_discovery_test tests/pointer_discovery_test.cpp)
+        target_link_libraries(pointer_discovery_test PRIVATE gcrecomp_tools)
+        add_test(NAME pointer_discovery COMMAND pointer_discovery_test)
         if(GCRECOMP_BUILD_RUNTIME)
             # Floating-point / paired-single semantics of the emitted code: the generator runs the emitter at
             # build time, the test compiles and runs the result.
