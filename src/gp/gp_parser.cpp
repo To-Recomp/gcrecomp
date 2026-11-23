@@ -298,6 +298,7 @@ private:
                     if (addr + i < 0x1100) g_state.xf[addr + i] = be32(p + 5 + 4 * i);
                 }
                 g_stats.xf_writes += count;
+                if (addr < 0x1020 && addr + count > 0x101A) ++g_state.gen;  // viewport
                 if ((addr == 0x101A || addr == 0x1020) && trace_xf_ < 10 && gp_trace_enabled()) {
                     ++trace_xf_;
                     std::fprintf(stderr, "[GP] XF 0x%04X count=%u lr=0x%08X:", addr, count, g_ctx.lr);
@@ -405,6 +406,7 @@ private:
             if (addr + i < 0x1100) g_state.xf[addr + i] = be32(src + 4 * i);
         }
         g_stats.xf_writes += len;
+        if (addr < 0x1020 && addr + len > 0x101A) ++g_state.gen;
     }
 
     void cp_write(uint8_t reg, uint32_t value) {
@@ -431,9 +433,11 @@ private:
             return;
         }
         const uint32_t mask = s.bp[0xFE] & 0xFFFFFF;
+        const uint32_t before = s.bp[reg];
         s.bp[reg] = (s.bp[reg] & ~mask) | (data & mask);
         s.bp[0xFE] = 0xFFFFFF;
         const uint32_t value = s.bp[reg];
+        if (value != before) ++s.gen;
 
         if (reg >= 0xE0 && reg <= 0xE7) {
             const uint32_t slot = (reg - 0xE0) / 2;
@@ -459,6 +463,7 @@ private:
             if (offset + bytes <= sizeof(s.tlut)) {
                 std::memcpy(s.tlut + offset, g_mem.read_ptr(src), bytes);
                 ++s.tlut_gen;
+            ++s.gen;
             }
         }
         if (reg == 0x47 || reg == 0x48) {
