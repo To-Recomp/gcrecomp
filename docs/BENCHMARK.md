@@ -107,3 +107,46 @@ the GPU stall of `glReadPixels`), `Memory` accessors called from the recompiled 
 copies on the GPU when the CPU never reads them back (needs the format quantisation emulated in a shader), a 144-byte vertex
 with eight texture coordinate sets (a leaner vertex format would cut the upload), indexed quads instead of expanding them, the
 recompiler polling at loop back-edges instead of counting every memory operation.
+
+## Battles (Tales of Symphonia, the first fights after Iselia; `tools/input-scripts/tos-battle.txt`)
+
+The owner's session showed 15 to 37 fps in battle seconds (200 000 to 340 000 draws a second) against 59.9 in the field of the village. The
+battle benchmark (above) reproduces it: before this change the battle segment ran at 43 to 45 fps (minimum 29 to 30) with the main
+thread at 65 to 68% of a core, while the seconds after the battle (results screens) already ran at 59.9.
+
+What a battle submits and what was expensive (`GCRECOMP_BENCH` counters, `GP_TRACE_TEX=1`, `perf`):
+
+* 4 000 to 6 000 draws a frame in the classroom style, but the profile of the battle seconds was not the draws: **46% of the main
+  thread was palette texture decoding** (`tlut_entry_to_rgba` 31%, `gx::decode_texture` 9%, `decode_indexed` 6%). The counters said
+  330 to 400 texture decodes and 85 to 100 million texels decoded a second, almost all C4 (`texdec_indexed`).
+* The trace named two 512x512 C4 textures decoded 5 to 6 times a frame each, always `palette changed`: the battle samples the same
+  texture with a different TLUT for each use (tinted effects), and a texture is decoded again whenever its palette holds other
+  contents (the GL texture is keyed by the texture's address and size). Texture data that really changed (`data changed`) was a
+  640x448 C4 image rewritten a few times a second (an EFB copy) and 24x24 C8 pieces.
+* Page-stamp validation (#41) is not the problem here: `texhash` (guest bytes read again to validate) was 2 to 3 MB a second in
+  battle against 30 MB in the village, and EFB-to-memory copies were 37 to 57 a second (about 10 million pixels read back a
+  second), with 4% of the profile.
+
+Fix: `decode_indexed` converts the palette once and walks the tiles once (a table read per texel instead of an integer-divide
+conversion per texel after two intermediate passes; same bytes, unit test against the previous implementation on random data).
+It does not avoid the repeated decodes (each use with another palette still decodes 262 144 texels), it makes each of them
+about a dozen times cheaper.
+
+Measured on the 16-core desktop (AMD GPU, nice 19, 140 s runs, the battle is random: two runs of each build, battle segment only,
+mean / minimum fps over the seconds of the segment; `[gp]` reports 0 unknown commands on all of them):
+
+| build | battle fps (run 1) | battle fps (run 2) | main thread | seconds after the battle (results screens) |
+| --- | --- | --- | --- | --- |
+| before | 43.2 (min 29) | 44.9 (min 30) | 67 to 68% | 59.9, 65% |
+| palette table decode | **59.8 (min 58)** | **59.8 (min 58)** | 57 to 59% | 59.9, 44 to 46% |
+
+(The draws a second differ between the builds because the faster one finishes more frames a second: 350 000 before, 500 000 after,
+about 8 000 draws a frame in these battles.) Pictures: the screenshots of the village, the village exit and the field are
+identical to those of the build before (`tools/frame_compare.py`, RMSE 0.00 to 0.25 for a field animation), the battle HUD
+screenshots show the same scene.
+
+Profile of a battle second after the change (main thread): `Parser::parse_one` with the inlined vertex decode 20%, `memmove`
+10% (parser buffers, expanded quads), `light_vertex` and its helpers 13%, GL driver 8%, `apply_state` 4%, `decode_indexed` 4%,
+`encode_efb_copy` 2%. The host has about 40% of a core to spare in a battle; the next costs, if a heavier battle needs them, are
+the vertex decode and lighting, the quad expansion and the per-use palette decodes (an index texture with the palette applied on
+the GPU would remove those, at the price of reproducing the console's filtering of palette textures in a shader).
