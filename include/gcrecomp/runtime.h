@@ -459,6 +459,55 @@ struct FuncTable {
     void call(uint32_t gc_addr, PPCContext* ctx, Memory* mem) const;
 };
 
+// =============================================================================
+// REL modules (see docs/REL_MODULES.md)
+//
+// Code that the game loads from the disc at run time (Dolphin SDK relocatable modules, OSLink) is recompiled to
+// position-independent C++. The generated registration unit hands one RelModuleDesc per module to
+// register_rel_module() from a static initialiser. When a call reaches an address that is in neither the DOL
+// function table nor an active module, FuncTable::call asks rel_lookup(): it finds the module the guest linked
+// there (the OSModuleInfo list at 0x800030C8), recognises it by its signature, reads its run-time section bases
+// into `base` (the generated code adds them to every address it computes) and returns the function.
+// =============================================================================
+struct RelFunc {
+    uint32_t       section;
+    uint32_t       offset;     // inside the section
+    RecompiledFunc fn;
+};
+
+struct RelModuleDesc {
+    const char*     name;
+    uint32_t        version;
+    uint32_t        num_sections;
+    const uint32_t* section_size;  // per section, as in the file (BSS included)
+    uint32_t        exec_mask;     // bit i set when section i is executable
+    uint32_t*       base;          // per section run-time address, written on activation, read by the generated code
+    const RelFunc*  funcs;
+    uint32_t        num_funcs;
+};
+
+// Guest address of __OSModuleInfoHead (the head of the OSModuleInfo list, tail at +4).
+constexpr uint32_t OS_MODULE_INFO_HEAD = 0x800030C8;
+
+void register_rel_module(const RelModuleDesc* desc);
+
+// The function of a linked, recompiled module at `gc_addr`; nullptr when no such module is linked there or the address
+// is not an entry the recompiler found. Activates the module on first use.
+RecompiledFunc rel_lookup(uint32_t gc_addr);
+
+// Run-time base of section `section` of the linked module with id `module_id` (0 when it is not linked). Generated code
+// uses it for relocations against a module other than itself and the DOL.
+uint32_t rel_import_base(uint32_t module_id, uint32_t section);
+
+// Forget every active module overlapping [addr, addr+size): ICInvalidateRange, the guest rewrote that memory.
+void rel_invalidate_range(uint32_t addr, uint32_t size);
+
+// "inside module X section S +0xOFF" for an address in a linked module, empty otherwise (diagnostics).
+std::string rel_describe(uint32_t gc_addr);
+
+// Forgets every activation, keeping the registered modules (tests that relink a module).
+void rel_reset_active();
+
 // Last-dispatch probe, for diagnosing hangs.
 //
 // call() records every dispatch here. A watchdog can sample this: if the

@@ -11,6 +11,7 @@
 // =============================================================================
 
 #include "gcrecomp/ppc_to_c.h"
+#include <cctype>
 #include "gcrecomp/symbol_map.h"
 #include <cstdio>
 #include <cstdarg>
@@ -21,19 +22,40 @@
 
 namespace gcrecomp {
 
+    static void append_formatted(std::string& dst, const char* fmt, va_list args) {
+        va_list copy;
+        va_copy(copy, args);
+        const int n = vsnprintf(nullptr, 0, fmt, copy);
+        va_end(copy);
+        if (n <= 0) return;
+        const size_t at = dst.size();
+        dst.resize(at + (size_t)n + 1);
+        vsnprintf(&dst[at], (size_t)n + 1, fmt, args);
+        dst.resize(at + (size_t)n);
+    }
+
     void PPCToCEmitter::emit(const char* fmt, ...) {
-        for (int i = 0; i < indent_level; i++) fprintf(out, "    ");
+        std::string indent;
+        for (int i = 0; i < indent_level; i++) indent += "    ";
         va_list args;
         va_start(args, fmt);
-        vfprintf(out, fmt, args);
+        if (capture) {
+            *capture += indent;
+            append_formatted(*capture, fmt, args);
+            *capture += "\n";
+        } else {
+            fputs(indent.c_str(), out);
+            vfprintf(out, fmt, args);
+            fputc('\n', out);
+        }
         va_end(args);
-        fprintf(out, "\n");
     }
 
     void PPCToCEmitter::emit_raw(const char* fmt, ...) {
         va_list args;
         va_start(args, fmt);
-        vfprintf(out, fmt, args);
+        if (capture) append_formatted(*capture, fmt, args);
+        else vfprintf(out, fmt, args);
         va_end(args);
     }
 
@@ -85,6 +107,141 @@ namespace gcrecomp {
         return buf;
     }
 
+    bool RelEmitInfo::locate(uint32_t vaddr, uint32_t& section, uint32_t& offset) const {
+        for (size_t i = 0; i < section_vbase.size(); i++) {
+            if (section_size[i] != 0 && vaddr >= section_vbase[i] && vaddr - section_vbase[i] < section_size[i]) {
+                section = (uint32_t)i;
+                offset = vaddr - section_vbase[i];
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::string RelEmitInfo::addr_expr(uint32_t vaddr) const {
+        uint32_t sec = 0, off = 0;
+        // The address just past the end of a section (a return address after its last instruction) belongs to it.
+        if (!locate(vaddr, sec, off) && !locate(vaddr - 1, sec, off)) {
+            char buf[32];
+            snprintf(buf, sizeof buf, "0x%08Xu", vaddr);
+            return buf;
+        }
+        off = vaddr - section_vbase[sec];
+        char buf[96];
+        snprintf(buf, sizeof buf, "(%s[%u] + 0x%Xu)", base_array.c_str(), sec, off);
+        return buf;
+    }
+
+    std::string PPCToCEmitter::lr_value(uint32_t vaddr) const {
+        if (!rel) {
+            char buf[32];
+            snprintf(buf, sizeof buf, "0x%08Xu", vaddr);
+            return buf;
+        }
+        return rel->addr_expr(vaddr);
+    }
+
+    std::string PPCToCEmitter::call_external(const std::string& target, const std::string& lr) const {
+        std::string s = "{ ";
+        // A constant target (a function of the DOL) is looked up once per call site: the same as a direct call from
+        // DOL code. A target computed from another module's base is resolved on every call.
+        const bool constant = target.rfind("0x", 0) == 0;
+        if (constant) s += "static const gcrecomp::RecompiledFunc f_ = g_func_table.lookup(" + target + "); ";
+        if (!lr.empty()) s += "ctx->lr = " + lr + "; ";
+        if (constant) s += "if (f_) f_(ctx, mem); else ";
+        s += "CALL_INDIRECT(" + target + ", ctx, mem); }";
+        return s;
+    }
+
+    std::string PPCToCEmitter::jump_to(const PPCInsn& insn) const {
+        if (rel) {
+            const auto it = rel->external_branch.find(insn.address);
+            if (it != rel->external_branch.end()) return "{ " + call_external(it->second, "") + " return; }";
+        }
+        char buf[48];
+        snprintf(buf, sizeof buf, "goto label_%08X;", (uint32_t)insn.branch_target);
+        return buf;
+    }
+
+    // An instruction whose 16-bit immediate is a relocation: the value is built from the run-time section bases.
+    void PPCToCEmitter::emit_reloc_insn(const PPCInsn& insn, const RelImm& imm) {
+        const std::string t = "(uint32_t)(" + imm.target + ")";
+        std::string f;  // the 16 bits the linker writes into the instruction
+        switch (imm.kind) {
+        case RelImmKind::Plain:
+        case RelImmKind::Lo: f = "(uint16_t)(" + t + ")"; break;
+        case RelImmKind::Hi: f = "(uint16_t)(" + t + " >> 16)"; break;
+        case RelImmKind::Ha: f = "(uint16_t)((" + t + " + 0x8000u) >> 16)"; break;
+        }
+        emit("// 0x%08X: %s (relocated)", insn.address, insn.mnemonic.c_str());
+        switch (insn.type) {
+        case PPCInsnType::ADDI:
+            if (insn.ra == 0)
+                emit("ctx->r[%u] = (uint32_t)(int32_t)(int16_t)%s;", insn.rd, f.c_str());
+            else
+                emit("ctx->r[%u] = ctx->r[%u] + (uint32_t)(int32_t)(int16_t)%s;", insn.rd, insn.ra, f.c_str());
+            emitted_imm.push_back(insn.address);
+            return;
+        case PPCInsnType::ADDIS:
+            if (insn.ra == 0)
+                emit("ctx->r[%u] = (uint32_t)%s << 16;", insn.rd, f.c_str());
+            else
+                emit("ctx->r[%u] = ctx->r[%u] + ((uint32_t)%s << 16);", insn.rd, insn.ra, f.c_str());
+            emitted_imm.push_back(insn.address);
+            return;
+        case PPCInsnType::ORI:
+            emit("ctx->r[%u] = ctx->r[%u] | (uint32_t)%s;", insn.ra, insn.rs, f.c_str());
+            emitted_imm.push_back(insn.address);
+            return;
+        case PPCInsnType::ORIS:
+            emit("ctx->r[%u] = ctx->r[%u] | ((uint32_t)%s << 16);", insn.ra, insn.rs, f.c_str());
+            emitted_imm.push_back(insn.address);
+            return;
+        default:
+            break;
+        }
+
+        // Anything else with a displacement (loads, stores, update forms): translate the instruction with a marker
+        // for its signed 16-bit field and put the expression where the marker landed.
+        constexpr int32_t kSimm = 28351, kUimm = 29473;
+        PPCInsn marked = insn;
+        marked.simm = kSimm;
+        marked.uimm = (uint32_t)kUimm;
+        std::string text;
+        std::string* const saved_capture = capture;
+        capture = &text;
+        in_reloc_rewrite = true;
+        emit_insn(marked);
+        in_reloc_rewrite = false;
+        capture = saved_capture;
+
+        auto replace_marker = [&text](const std::string& marker, const std::string& with) {
+            size_t n = 0;
+            for (size_t at = text.find(marker); at != std::string::npos; at = text.find(marker, at)) {
+                const bool before = at > 0 && isalnum((unsigned char)text[at - 1]);
+                const bool after = at + marker.size() < text.size() && isalnum((unsigned char)text[at + marker.size()]);
+                if (before || after) { at += marker.size(); continue; }
+                text.replace(at, marker.size(), with);
+                at += with.size();
+                n++;
+            }
+            return n;
+        };
+        const size_t unsigned_uses = replace_marker(std::to_string(kUimm), "<unsigned-use>");
+        const size_t signed_uses = replace_marker(std::to_string(kSimm), "((int32_t)(int16_t)" + f + ")");
+        if (signed_uses == 0 || unsigned_uses != 0) {
+            unhandled_reloc++;
+            emit("#error \"relocation on an instruction the emitter cannot make position independent: 0x%08X %s\"",
+                 insn.address, insn.mnemonic.c_str());
+            return;
+        }
+        // `text` holds whole lines (with their comment); the one this function printed already says "relocated".
+        const size_t nl = text.find('\n');
+        const std::string body = nl == std::string::npos ? text : text.substr(nl + 1);
+        emit_raw("%s", body.c_str());
+        emitted_imm.push_back(insn.address);
+    }
+
     void PPCToCEmitter::emit_insn(const PPCInsn& insn) {
         // The OE forms (addo, subfo, nego, mullwo, divwo ...) also set XER[OV] (and the sticky SO). The overflow is
         // computed from the operands as they were before the operation (rD may be rA or rB), then CR0 follows when
@@ -123,6 +280,14 @@ namespace gcrecomp {
                 emit("  { const uint32_t r = ctx->r[%u]; ctx->set_xer_ov(%s); }", insn.rd, ov);
                 if (insn.rc) emit("  ctx->update_cr0((int32_t)ctx->r[%u]);", insn.rd);
                 emit("}");
+                return;
+            }
+        }
+
+        if (rel && !in_reloc_rewrite) {
+            const auto it = rel->imm.find(insn.address);
+            if (it != rel->imm.end()) {
+                emit_reloc_insn(insn, it->second);
                 return;
             }
         }
@@ -975,9 +1140,22 @@ namespace gcrecomp {
         // ==== Branch ====
         case PPCInsnType::B:
             if (insn.link) {
+                const std::string* ext = nullptr;
+                if (rel) {
+                    auto it = rel->external_branch.find(insn.address);
+                    if (it != rel->external_branch.end()) ext = &it->second;
+                }
                 bool known = func_map && func_map->find(insn.branch_target) != func_map->end();
-                if (known) {
-                    emit("ctx->lr = 0x%08Xu; %s(ctx, mem); // bl", insn.address + 4, name_for(insn.branch_target).c_str());
+                if (ext) {
+                    emit("%s // bl (outside the module)", call_external(*ext, lr_value(insn.address + 4)).c_str());
+                } else if (known) {
+                    emit("ctx->lr = %s; %s(ctx, mem); // bl", lr_value(insn.address + 4).c_str(),
+                         name_for(insn.branch_target).c_str());
+                } else if (rel) {
+                    // A module branch that is neither a module function nor a relocated import cannot be position
+                    // independent: it is reported, not guessed.
+                    unhandled_reloc++;
+                    emit("#error \"bl to an unknown target in a REL module (0x%08X)\"", insn.address);
                 } else {
                     // Target not in CFG (e.g., `bla 0x60` into a low/vector address).
                     // Route through the function table so it becomes a runtime
@@ -986,7 +1164,7 @@ namespace gcrecomp {
                          insn.address + 4, insn.branch_target);
                 }
             } else {
-                emit("goto label_%08X; // b", insn.branch_target);
+                emit("%s // b", jump_to(insn).c_str());
             }
             break;
 
@@ -998,30 +1176,31 @@ namespace gcrecomp {
             uint32_t bi = insn.bi;
             bool skip_ctr = (bo & 0x04) != 0;
             bool skip_cr  = (bo & 0x10) != 0;
+            const std::string go = jump_to(insn);
 
             if (skip_ctr && skip_cr) {
                 // BO=20: unconditional (shouldn't normally appear as bc, but handle it)
-                emit("goto label_%08X; // bc (always)", insn.branch_target);
+                emit("%s // bc (always)", go.c_str());
             } else if (skip_ctr && !skip_cr) {
                 // Pure CR test (most common: BO=4 bf, BO=12 bt)
                 bool cr_sense = (bo & 0x08) != 0;
                 if (cr_sense)
-                    emit("if (ctx->get_cr_bit(%u)) goto label_%08X; // bt cr%u", bi, insn.branch_target, bi);
+                    emit("if (ctx->get_cr_bit(%u)) %s // bt cr%u", bi, go.c_str(), bi);
                 else
-                    emit("if (!ctx->get_cr_bit(%u)) goto label_%08X; // bf cr%u", bi, insn.branch_target, bi);
+                    emit("if (!ctx->get_cr_bit(%u)) %s // bf cr%u", bi, go.c_str(), bi);
             } else if (!skip_ctr && skip_cr) {
                 // CTR decrement only (BO=16 bdnz, BO=18 bdz)
                 bool ctr_zero = (bo & 0x02) != 0;
                 if (ctr_zero)
-                    emit("if (--ctx->ctr == 0) goto label_%08X; // bdz", insn.branch_target);
+                    emit("if (--ctx->ctr == 0) %s // bdz", go.c_str());
                 else
-                    emit("if (--ctx->ctr != 0) goto label_%08X; // bdnz", insn.branch_target);
+                    emit("if (--ctx->ctr != 0) %s // bdnz", go.c_str());
             } else {
                 // Both CTR and CR test (rare)
                 bool cr_sense = (bo & 0x08) != 0;
                 bool ctr_zero = (bo & 0x02) != 0;
-                emit("{ ctx->ctr--; if (ctx->ctr %s 0 && %sctx->get_cr_bit(%u)) goto label_%08X; } // bc %u, %u",
-                     ctr_zero ? "==" : "!=", cr_sense ? "" : "!", bi, insn.branch_target, bo, bi);
+                emit("{ ctx->ctr--; if (ctx->ctr %s 0 && %sctx->get_cr_bit(%u)) %s } // bc %u, %u",
+                     ctr_zero ? "==" : "!=", cr_sense ? "" : "!", bi, go.c_str(), bo, bi);
             }
             break;
         }
@@ -1030,7 +1209,8 @@ namespace gcrecomp {
             if (insn.is_return()) {
                 emit("return; // blr");
             } else if (insn.link) {
-                emit("{ uint32_t target = ctx->lr; ctx->lr = 0x%08Xu; CALL_INDIRECT(target, ctx, mem); } // blrl", insn.address + 4);
+                emit("{ uint32_t target = ctx->lr; ctx->lr = %s; CALL_INDIRECT(target, ctx, mem); } // blrl",
+                     lr_value(insn.address + 4).c_str());
             } else {
                 // Conditional return via LR
                 uint32_t bo = insn.bo;
@@ -1059,7 +1239,7 @@ namespace gcrecomp {
 
         case PPCInsnType::BCCTR:
             if (insn.link) {
-                emit("ctx->lr = 0x%08Xu; CALL_INDIRECT(ctx->ctr, ctx, mem); // bctrl", insn.address + 4);
+                emit("ctx->lr = %s; CALL_INDIRECT(ctx->ctr, ctx, mem); // bctrl", lr_value(insn.address + 4).c_str());
             } else {
                 // Switch table: use resolved jump table targets if available,
                 // otherwise fall back to all block addresses in this function.
@@ -1068,17 +1248,38 @@ namespace gcrecomp {
                     ? block_addrs : current_block->jump_table_targets;
                 emit("// bctr -- switch table dispatch%s",
                      current_block->jump_table_targets.empty() ? " (unresolved)" : "");
-                emit("switch (ctx->ctr) {");
                 // A jump table routinely maps several indices onto one case
                 // body, so the same target appears more than once; C needs
                 // each case label exactly once.
                 std::set<uint32_t> emitted;
-                for (uint32_t addr : targets) {
-                    if (!emitted.insert(addr).second) continue;
-                    emit("    case 0x%08Xu: goto label_%08X;", addr, addr);
+                if (rel) {
+                    // The table in guest memory holds run-time addresses: switch on the offset inside the section.
+                    std::map<uint32_t, std::vector<uint32_t>> by_section;
+                    for (uint32_t addr : targets) {
+                        uint32_t sec = 0, off = 0;
+                        if (!emitted.insert(addr).second || !rel->locate(addr, sec, off)) continue;
+                        by_section[sec].push_back(addr);
+                    }
+                    for (const auto& [sec, addrs] : by_section) {
+                        emit("switch (ctx->ctr - %s[%u]) {", rel->base_array.c_str(), sec);
+                        for (uint32_t addr : addrs) {
+                            uint32_t s2 = 0, off = 0;
+                            rel->locate(addr, s2, off);
+                            emit("    case 0x%Xu: goto label_%08X;", off, addr);
+                        }
+                        emit("    default: break;");
+                        emit("}");
+                    }
+                    emit("CALL_INDIRECT(ctx->ctr, ctx, mem); // fallback: tail call");
+                } else {
+                    emit("switch (ctx->ctr) {");
+                    for (uint32_t addr : targets) {
+                        if (!emitted.insert(addr).second) continue;
+                        emit("    case 0x%08Xu: goto label_%08X;", addr, addr);
+                    }
+                    emit("    default: CALL_INDIRECT(ctx->ctr, ctx, mem); break; // fallback: tail call");
+                    emit("}");
                 }
-                emit("    default: CALL_INDIRECT(ctx->ctr, ctx, mem); break; // fallback: tail call");
-                emit("}");
             }
             break;
 
@@ -1125,6 +1326,7 @@ namespace gcrecomp {
             break;
 
         default:
+            unimplemented++;
             emit("// UNIMPLEMENTED: %s (0x%08X)", insn.mnemonic.c_str(), insn.raw);
             break;
         }

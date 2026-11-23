@@ -384,7 +384,9 @@ static void os_dcache_store(PPCContext* ctx, Memory* mem) {
 }
 
 static void os_icache_invalidate(PPCContext* ctx, Memory* mem) {
-    // ICInvalidateRange(void* addr, uint32_t size) -- no-op
+    // ICInvalidateRange(void* addr, uint32_t size): no instruction cache to flush, but the guest rewrote the memory:
+    // a REL module that was linked there is gone (docs/REL_MODULES.md).
+    rel_invalidate_range(ctx->r[3], ctx->r[4]);
 }
 
 // =============================================================================

@@ -173,7 +173,9 @@ Every game has its own quirks. Common things to watch for:
 - **Memory card access**: gcrecomp stubs `CARD*` functions. If the game needs saves,
   implement the stubs to read/write local files.
 - **Audio codecs**: Some games use custom audio formats beyond standard DSP ADPCM.
-- **REL modules**: Games that dynamically load code need the REL loader implemented.
+- **REL modules**: Games that load code from the disc at run time (`[FuncTable] Unresolved call` to a
+  heap address) need those modules recompiled too: pass every `.rel` to `gcrecomp_recompiler --rel`, in the
+  same run as the DOL. See [REL_MODULES.md](REL_MODULES.md).
 
 ## Common Problems and Solutions
 
