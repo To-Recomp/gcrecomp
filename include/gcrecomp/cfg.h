@@ -36,6 +36,10 @@ struct Function {
     bool     is_leaf;
 };
 
+// Heuristic: does `addr` begin a function (frame set up, or a leaf that never touches r1), as
+// opposed to landing mid-function in somebody's epilogue? See cfg_builder.cpp.
+bool looks_like_function_entry(uint32_t addr, const DOLFile& dol);
+
 struct CFG {
     std::map<uint32_t, Function> functions;
     std::set<uint32_t> call_targets;
@@ -45,6 +49,8 @@ struct CFG {
     void add_extra_entries(const std::vector<uint32_t>& addrs);
     void build_functions(const DOLFile& dol);
     void discover_functions(const DOLFile& dol);
+    // Seed `entry` and build its Function now (used after build_functions(), e.g. by pointer discovery).
+    void add_function(uint32_t entry, const DOLFile& dol);
     void build_blocks(Function& func, const DOLFile& dol);
     std::vector<uint32_t> detect_jump_table(const Function& func, uint32_t bctr_addr, const DOLFile& dol);
     void print_stats() const;

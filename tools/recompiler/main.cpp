@@ -10,6 +10,8 @@
 //   --csv <file>       Load symbol map (CSV format)
 //   --output <dir>     Output directory (default: ./recompiled)
 //   --extra-funcs <f>  Force-add function entries (one hex addr per line)
+//   --discover-pointers <off|safe|aggressive>  Find callback entries (default: safe)
+//   --report-pointers <f>  Write the pointer-discovery candidate report
 //   --info             Print DOL info and exit
 //   --stats            Print CFG statistics and exit
 // =============================================================================
@@ -19,6 +21,7 @@
 #include "gcrecomp/cfg.h"
 #include "gcrecomp/symbol_map.h"
 #include "gcrecomp/ppc_to_c.h"
+#include "gcrecomp/pointer_discovery.h"
 #include "gcrecomp/rel.h"
 #include "gcrecomp/yaz0.h"
 #include <cstdio>
@@ -43,6 +46,12 @@ static void print_usage(const char* prog) {
     printf("  --extra-funcs <file> Force-add function entries (one hex addr/line)\n");
     printf("  --funcs-per-file <n> Functions per output file (default: 200)\n");
     printf("  --project <name>     Project name in file headers\n");
+    printf("  --discover-pointers <off|safe|aggressive>\n");
+    printf("                       Find function entries reached only through pointers\n");
+    printf("                       (lis/addi address loads, code addresses in data) and\n");
+    printf("                       promote them (default: safe; also --discover-pointers=<p>)\n");
+    printf("  --report-pointers <file>\n");
+    printf("                       Write the pointer-discovery candidate report ('-' = stdout)\n");
     printf("  --info               Print DOL info and exit\n");
     printf("  --stats              Print CFG statistics and exit\n");
     printf("  --trace              Emit TRACE_ENTER(addr) at every function entry\n");
@@ -119,6 +128,8 @@ int main(int argc, char** argv) {
     std::string rel_name;
     uint32_t    rel_base = 0x82000000u;
     int funcs_per_file = 200;
+    PointerPolicy pointer_policy = PointerPolicy::Safe;
+    std::string pointer_report_path;
     bool info_only = false;
     bool stats_only = false;
     bool trace = false;
@@ -139,6 +150,15 @@ int main(int argc, char** argv) {
             project_name = argv[++i];
         } else if (strcmp(argv[i], "--funcs-per-file") == 0 && i + 1 < argc) {
             funcs_per_file = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--discover-pointers") == 0 ||
+                   strncmp(argv[i], "--discover-pointers=", 20) == 0) {
+            const char* v = argv[i][19] == '=' ? argv[i] + 20 : (i + 1 < argc ? argv[++i] : "");
+            if (!parse_pointer_policy(v, pointer_policy)) {
+                fprintf(stderr, "Error: --discover-pointers expects off, safe or aggressive (got '%s')\n", v);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--report-pointers") == 0 && i + 1 < argc) {
+            pointer_report_path = argv[++i];
         } else if (strcmp(argv[i], "--info") == 0) {
             info_only = true;
         } else if (strcmp(argv[i], "--stats") == 0) {
@@ -267,6 +287,25 @@ int main(int argc, char** argv) {
     }
 
     cfg.build_functions(dol);
+
+    // Entries reached only through pointers (callbacks): see docs/POINTER_DISCOVERY.md.
+    if (pointer_policy != PointerPolicy::Off || !pointer_report_path.empty()) {
+        PointerDiscoveryResult found = discover_pointer_entries(cfg, dol, pointer_policy);
+        printf("[CFG] Pointer discovery (%s): %zu candidates, %zu promoted\n",
+               pointer_policy_name(pointer_policy), found.candidates.size(), found.promoted);
+        for (const auto& c : found.candidates) {
+            if (c.promoted) cfg.add_function(c.target, dol);
+        }
+        if (!pointer_report_path.empty()) {
+            FILE* rf = pointer_report_path == "-" ? stdout : fopen(pointer_report_path.c_str(), "w");
+            if (rf) {
+                write_pointer_report(rf, found);
+                if (rf != stdout) fclose(rf);
+            } else {
+                fprintf(stderr, "Warning: Could not write pointer report: %s\n", pointer_report_path.c_str());
+            }
+        }
+    }
     cfg.print_stats();
 
     if (stats_only) return 0;

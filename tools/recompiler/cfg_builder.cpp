@@ -23,6 +23,8 @@ bool experimental_cfg() {
     return !legacy;
 }
 
+}  // namespace
+
 // Does `addr` begin a function, or land mid-way through one?
 //
 // The tail-call heuristic below promotes distant `b` targets to function
@@ -77,10 +79,6 @@ bool looks_like_function_entry(uint32_t addr, const DOLFile& dol) {
     }
     return true;
 }
-
-
-}  // namespace
-
 
 void CFG::build(const DOLFile& dol) {
     scan_targets(dol);
@@ -271,6 +269,19 @@ void CFG::discover_functions(const DOLFile& dol) {
         build_blocks(func, dol);
         functions[entry] = std::move(func);
     }
+}
+
+void CFG::add_function(uint32_t entry, const DOLFile& dol) {
+    call_targets.insert(entry);
+    if (functions.count(entry) || !dol.is_code(entry)) return;
+    Function func;
+    func.entry = entry;
+    func.is_leaf = true;
+    char name_buf[64];
+    snprintf(name_buf, sizeof(name_buf), "func_%08X", entry);
+    func.name = name_buf;
+    build_blocks(func, dol);
+    functions[entry] = std::move(func);
 }
 
 void CFG::build_blocks(Function& func, const DOLFile& dol) {
