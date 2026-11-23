@@ -1,0 +1,42 @@
+# Tales of Symphonia (GQSF, PAL French): from a save on the world map next to the Temple de Martel to the fight with the
+# first temple boss (Vidarr, with Kratos in the party). Inputs only, no game data.
+#
+# Needs the owner's memory card image whose THIRD save in the 'Charger' list (play time 0:13, Lloyd level 3) stands on the
+# world map next to the temple (tools/run-scripted.sh / tools/benchmark.py --card-in CARD.raw; the harness works on a copy).
+# The 4th save of that card is already inside the temple (a save point), not used here.
+#
+# Flow: boot, skip the movie, 'Charger' -> slot A -> 3rd save -> 'Oui'; walk up+left to the temple ('Entrer', A); walk the path
+# to the first cutscene (ev/sce_001_009.afs: the Renegades), A through the dialogue to the soldier battle (BTL: bgm_b000),
+# A-mash until its victory (BTLwin.bfp), then the second battle (BTLKratos.cab, bgm_b006) is the boss fight: A-mash until its
+# victory music s/bgm_b010.song. About 210 s of wall time (harness `seconds`: 230). The boss fight starts ~100 s into the run.
+# `shot` lines are screenshots to look at and markers for tools/benchmark.py:
+#   tools/benchmark.py ... --script tools/input-scripts/tos-vidarr.txt --card-in CARD.raw --seconds 230 \
+#       --segment temple=map/hol_d00 --segment cutscene=cmd:shot e1 --segment soldiers=cmd:shot b1 \
+#       --segment boss=BTLKratos --segment end=cmd:shot end1
+wait-file mov/op.h4m timeout=120
+press S                                           # START skips the opening movie
+wait-file title.tpl timeout=30
+wait 500
+press D; wait 30                                  # Charger partie
+press A; wait 150                                 # 'Charger'
+press A; wait 100                                 # slot A: the list of saves
+press D; wait 30; press D; wait 30                # the third save (check 'load-confirm': '3/4', 0:13)
+press A; wait 100                                 # confirmation
+shot load-confirm
+press A                                           # Oui
+wait 500                                          # the world map loads (FR_m_top2field.rel; no d.d for this save)
+shot loaded
+stick up+left hold=200; wait 200                  # to the temple entrance ('Temple de Martel: Entrer / Partir'); walking on is blocked there
+shot w1
+press-until-file map/hol_d00 A every=60 hold=5 timeout=40       # Entrer (repeated: does not depend on how long the walk took)
+wait 120
+stick-until-file ev/sce_001_009 up+right right up every=40 hold=40 timeout=45   # up the path to the cutscene
+shot e1
+wait 120; shot e2
+wait 200; shot e3
+press-until-file top2btl.rel A every=40 hold=5 timeout=60                       # through the dialogue to the first battle
+shot b1
+wait 300; shot b2
+press-until-file s/bgm_b010.song A every=12 hold=4 timeout=200                   # A-mash: soldiers, then the boss
+shot end1
+wait 300; shot end2

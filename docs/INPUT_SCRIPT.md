@@ -81,3 +81,4 @@ shot next
 * `tools/input-scripts/tos-classroom.txt`, `tos-first-walk.txt`, `tos-menu.txt`: the next segments (the classroom cutscene, walking, the field menu; the last one is exploratory).
 * `tools/input-scripts/tos-new-game.txt`: example, Tales of Symphonia from a blank card to the opening classroom scene (the first dialogue).
 * `tools/input-scripts/tos-battle.txt`: Tales of Symphonia from a save (`--card-in`: the memorial circle in Iselia) to a battle on the field map and through it; see docs/BENCHMARK.md ("A battle").
+* `tools/input-scripts/tos-vidarr.txt`: from the third save of the owner's card (world map, Temple de Martel) into the temple, the first fights and the boss fight (needs `--card-in`); see docs/BENCHMARK.md ("The first temple boss"). Its menu steps depend on timing: check the `load-confirm` and `w1` screenshots.

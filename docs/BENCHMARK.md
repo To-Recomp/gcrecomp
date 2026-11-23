@@ -22,6 +22,7 @@ stderr (`src/gp/bench.cpp`, `include/gcrecomp/bench.h`). It costs nothing when t
 | `texdec`, `texdec_indexed`, `textexels` | textures decoded and uploaded to the GPU in the interval, of which palette formats (C4, C8, C14X2), and the texels decoded. A texture is decoded again when its guest bytes change (the game rewrote it, an EFB copy landed in it) or, for a palette format, when its palette (TLUT) holds other contents. `GP_TRACE_TEX=1` says which texture and why (docs/DEBUGGING.md). |
 | `texhash`, `texhash_bytes` | uses of a texture that read its guest bytes again to see whether they changed (the page write stamps skip this while nothing stored to the texture's pages), and the bytes read. |
 | `efbmem`, `efbmem_px` | EFB-to-memory copies (read back from the GPU and encoded) and the pixels they read. |
+| `parse_ms`, `draw_ms`, `readback_ms`, `swap_ms` | wall milliseconds per second spent in `Parser::draw` (vertex decode, transform, lighting, **including** the renderer call), in `renderer::draw` alone (state, vertex upload, GL calls), in the `glReadPixels` of EFB-to-memory copies (the wait for the GPU) and in the blit and buffer swap of a presented frame. Measured with two clock reads per call only while `GCRECOMP_BENCH` is set (about 5% overhead at 500 000 draws a second). `parse_ms - draw_ms` is the decode. |
 | `cpu` | CPU time of the whole process over wall time (100% = one core). `threads` lists the threads above 1%: the guest/main thread, the GL driver threads (`gdrv`, `gl`), audio. |
 | `idle` | share of wall time every guest thread was blocked waiting for the retrace or an alarm (`sched::idle_ns`). High: the VI clock throttles the game, the host has CPU to spare. About 0 with `fps` below 60: flat out, the host is the limit. |
 
@@ -175,3 +176,48 @@ Profile of a battle second after the change (main thread): `Parser::parse_one` w
 `encode_efb_copy` 2%. The host has about 40% of a core to spare in a battle; the next costs, if a heavier battle needs them, are
 the vertex decode and lighting, the quad expansion and the per-use palette decodes (an index texture with the palette applied on
 the GPU would remove those, at the price of reproducing the console's filtering of palette textures in a shader).
+
+## The first temple boss (Vidarr; `tools/input-scripts/tos-vidarr.txt`)
+
+The owner's session showed two stretches at exactly 30.0 fps (about 10 s of arrival, three runs of 10 to 16 s in the fight). What they are:
+
+* **"Arrival" (t=322 to 332 of his log) is the world map**: `FR_m_top2field.rel` is loaded and the game itself runs the map at 30 (the host is 54% idle
+  there, 12 ms of main thread per frame). It is not a slowdown of ours.
+* **The fight is.** `tos-vidarr.txt` loads the third save of his card (world map next to the Temple de Martel, play time 0:13), walks into the temple,
+  through the Renegades cutscene and the soldier battle (`BTLenemy`, bgm_b000) to the boss battle (`BTLKratos.cab`, bgm_b006, ~100 s into the run;
+  screenshots `e1`..`e3` cutscene, `b1`/`b2` soldiers, the boss is on screen in `frame_*` shots) and A-mashes to its end. The 30 fps stretches
+  appear there at the spell effects ("Boule de feu", "Rayonnement") with the same numbers as in his log (267 000 draws and 2.33 M vertices a second
+  at 30 fps, 8 900 draws a frame). The script is timing-fragile at the menus (the same input sometimes loads another save): check `load-confirm`
+  ('3/4', 0:13) and `w1` ('Temple de Martel: Entrer') in the screenshots.
+
+The game decides to run at 30 by itself when frames take too long: with `GP_SKIP_DRAW=1` (the draws are parsed and decoded but not given to GL) the
+same fight stays at 59 fps from start to end, with 280 000 to 600 000 draws a second. So the host cost per frame decides, and the game's
+drop lasts until the scene changes (the stretches end at effect boundaries; [INFERENCE] that the game keeps 30 while its frame time stays over the budget).
+
+Per frame in the 30 fps stretches (16-core desktop, `tools/benchmark.py ... --segment boss=BTLKratos`; the GL device of a headless run is the
+Ryzen's Radeon 610M, not the 7800 XT of the owner's window, `DRI_PRIME` does not select the other one under `SDL_VIDEO_DRIVER=offscreen`):
+
+| | draws a frame | `Parser::draw` incl. renderer | of which `renderer::draw` | EFB read-back wait |
+| --- | --- | --- | --- | --- |
+| 30 fps stretches | 9 500 | 10.3 ms | 5.6 ms | 6 ms (iGPU: the GPU finishes the frame's draws here) |
+| heavy 60 fps frames | 8 100 | 7.0 ms | 3.2 ms | 0.5 ms |
+
+Profile of the boss fight (perf, main process): vertex decode with the parser 40%, GL driver and its thread ~15%, `memmove` 6 to 12%,
+guest code 3 to 4%, memory accessors 8%. A frame costs ~10 ms of parse and GL calls before the guest and the read-back wait are counted, so the
+16.7 ms budget is exceeded when the GPU is slow to finish the frame (the read-back is a full GPU sync once or twice a frame).
+
+Changes of this branch (picture-identical: screenshots of the cutscene frames compare at RMSE 0.00, soldier battle frames at 0.15; `[gp]` 0 unknown;
+ctest passes) and what they bought, boss segment of the script, mean fps / minimum, two runs are within 1 fps of each other:
+
+| build | boss fps (mean / min) | 30 fps stretch: parse ms/frame | heavy 60 fps frames: parse ms/frame |
+| --- | --- | --- | --- |
+| before | 42.5 / 29 | 10.3 | 7.0 |
+| quads written straight into the vertex buffer, no unlit-channel lighting or normal transform (the loop's `lit` array shadowed the flag, so the normal was always transformed), exact reciprocal-power-of-two scaling, layout cache, array bases resolved once per draw, texgen decode hoisted | 43.0 / 29 | 10.3 | 7.2 |
+
+So these micro-optimisations are correct but **do not move the fps**: the boss frames light all their vertices and are dominated by what the
+list above names. What the next change must do (measured leads, not done): (1) fewer GL calls per draw (a persistent mapped vertex ring instead of
+map/unmap per draw, skipping `apply_state` when no BP/viewport register changed since the previous draw, merging consecutive triangle/quad draws whose
+state is identical into one `glDrawArrays`: the vertices are transformed on the CPU, so a matrix load between two draws does not matter);
+(2) a vertex with only the texture coordinate sets in use (the 144-byte vertex is memmove traffic); (3) the SIMD or table-driven lighting;
+(4) moving the EFB read-back off the critical path where the CPU never reads the copy. A GP stream record/replay (headless, no CPU) would
+allow profiling these offline; not built yet.

@@ -20,6 +20,7 @@ Switches and tools for finding out why a frame looks wrong. Nothing here needs a
 | `GP_XHIST=1` | Histogram of XF register writes at exit. |
 | `GP_TEX_VALIDATE=always` | Re-reads every texture's guest bytes on every use, as the renderer did before the write stamps (docs/BENCHMARK.md): a texture that looks stale with the default and right with this has a writer into guest RAM that does not call `Memory::mark_written`. Without it a texture is re-read when a store touched its pages, and in any case every 120 presented frames. |
 | `GP_TRACE_TEX=1` | Logs every texture decode (`[TEX] frame N decode map=M addr=ADDR fmt=F WxH levels=L REASON data=H palette=P`): the reason is `new`, `data changed` (the game rewrote the texture or an EFB copy landed in it) or `palette changed` (a palette format whose TLUT was loaded with other contents), with the hashes. A texture decoded every frame shows here; `GCRECOMP_BENCH` counts them (`texdec=`). |
+| `GP_SKIP_DRAW=1` | The draws are parsed and decoded but not given to GL: isolates the cost of the renderer and the GPU (a game that adapts its frame rate to the host runs faster; see docs/BENCHMARK.md, the first temple boss). The picture stays empty. |
 
 ## Environment variables (guest memory and calls)
 
