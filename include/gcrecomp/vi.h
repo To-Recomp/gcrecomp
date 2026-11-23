@@ -26,6 +26,7 @@
 namespace gcrecomp::vi {
 
 constexpr uint32_t kRegBase = 0xCC002000;  // VI register block
+constexpr uint32_t kRegDispConfig = 0x02;  // VI_DISP_CONFIG (16 bit): bit 0 enable, bits 8-9 video format (0 NTSC, 1 PAL, 2 MPAL)
 constexpr uint32_t kRegVertCount = 0x2C;   // VI_VERT_COUNT (16 bit); VI_HORIZ_COUNT follows at 0x2E
 constexpr uint32_t kRegDispInt0 = 0x30;
 constexpr uint32_t kDispIntCount = 4;
