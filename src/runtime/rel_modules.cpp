@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -118,8 +119,9 @@ bool find_node_containing(uint32_t addr, NodeView& out, uint32_t* sec_out = null
     return found;
 }
 
-// The activation still describes what the guest has linked: the node is in the list and its sections did not move.
-bool still_valid(const Active& a) {
+// Why the activation no longer describes what the guest has linked (nullptr when it does): the node is gone from the
+// list, or its sections moved.
+const char* invalid_reason(const Active& a) {
     bool in_list = false;
     NodeView node;
     for_each_node([&](const NodeView& n) {
@@ -128,11 +130,23 @@ bool still_valid(const Active& a) {
         node = n;
         return true;
     });
-    if (!in_list || node.num_sections != a.desc->num_sections || node.version != a.desc->version) return false;
+    if (!in_list) return "node no longer in the guest module list";
+    if (node.num_sections != a.desc->num_sections || node.version != a.desc->version) return "node changed shape";
     for (uint32_t i = 0; i < node.num_sections; ++i) {
-        if (section_len(node, i) != 0 && section_base(node, i) != a.base[i]) return false;
+        if (section_len(node, i) != 0 && section_base(node, i) != a.base[i]) return "section bases moved";
     }
-    return true;
+    return nullptr;
+}
+
+bool still_valid(const Active& a) { return invalid_reason(a) == nullptr; }
+
+// GCRECOMP_TRACE_REL=1: every activation, drop and refusal, with the guest heap state at each link.
+bool trace_rel() {
+    static const bool on = [] {
+        const char* v = std::getenv("GCRECOMP_TRACE_REL");
+        return v && *v && *v != '0';
+    }();
+    return on;
 }
 
 bool in_exec_range(const Active& a, uint32_t addr) {
@@ -180,6 +194,9 @@ RecompiledFunc rel_lookup(uint32_t gc_addr) {
             auto it = a.funcs.find(gc_addr);
             return it == a.funcs.end() ? nullptr : it->second;
         }
+        if (trace_rel())
+            std::fprintf(stderr, "[REL] drop activation of '%s' (node 0x%08X) on a call to 0x%08X: %s\n", a.desc->name,
+                         a.info, gc_addr, invalid_reason(a));
         r.active.erase(r.active.begin() + i);  // unlinked, freed or relinked elsewhere
         break;
     }
@@ -204,6 +221,9 @@ RecompiledFunc rel_lookup(uint32_t gc_addr) {
             }
             return nullptr;
         }
+        if (trace_rel())
+            std::fprintf(stderr, "[REL] replacing the activation of '%s' (node 0x%08X): %s\n", desc->name, a.info,
+                         invalid_reason(a));
         break;
     }
     erase_active_of(r, desc);
@@ -224,6 +244,12 @@ RecompiledFunc rel_lookup(uint32_t gc_addr) {
     std::printf("[REL] module '%s' (id %u) linked at 0x%08X: %zu functions registered\n", desc->name, node.id, node.info,
                 act.funcs.size());
     std::fflush(stdout);
+    if (trace_rel()) {
+        for (uint32_t i = 0; i < desc->num_sections; ++i)
+            std::fprintf(stderr, "[REL]   section %u at 0x%08X length 0x%X%s\n", i, act.base[i], desc->section_size[i],
+                         ((desc->exec_mask >> i) & 1u) ? " (code)" : "");
+        dump_guest_heaps("module link", &g_ctx, false);
+    }
     r.active.push_back(std::move(act));
     const Active& a = r.active.back();
     auto it = a.funcs.find(gc_addr);
@@ -244,6 +270,7 @@ void rel_invalidate_range(uint32_t addr, uint32_t size) {
     Registry& r = registry();
     std::lock_guard<std::mutex> g(r.lock);
     if (r.active.empty()) return;
+    if (trace_rel()) std::fprintf(stderr, "[REL] ICInvalidateRange 0x%08X+0x%X with %zu active module(s)\n", addr, size, r.active.size());
     const uint64_t end = uint64_t(addr) + size;
     r.active.erase(std::remove_if(r.active.begin(), r.active.end(),
                                   [&](const Active& a) {
@@ -281,6 +308,29 @@ void rel_reset_active() {
     Registry& r = registry();
     std::lock_guard<std::mutex> g(r.lock);
     r.active.clear();
+}
+
+void rel_dump_state() {
+    Registry& r = registry();
+    std::lock_guard<std::mutex> g(r.lock);
+    std::fprintf(stderr, "[REL] state: head=0x%08X tail=0x%08X, %zu recompiled module(s), %zu active\n",
+                 guest32(OS_MODULE_INFO_HEAD), guest32(OS_MODULE_INFO_HEAD + 4), r.descs.size(), r.active.size());
+    uint32_t count = 0;
+    for_each_node([&](const NodeView& n) {
+        ++count;
+        std::fprintf(stderr, "[REL]   node 0x%08X id %u version %u, %u section(s):", n.info, n.id, n.version, n.num_sections);
+        for (uint32_t i = 0; i < n.num_sections && i < 8; ++i)
+            std::fprintf(stderr, " [%u]=0x%08X+0x%X", i, section_base(n, i), section_len(n, i));
+        std::fprintf(stderr, "\n");
+        return false;
+    });
+    if (count == 0) std::fprintf(stderr, "[REL]   the guest module list is empty or unreadable\n");
+    for (const Active& a : r.active) {
+        const char* why = invalid_reason(a);
+        std::fprintf(stderr, "[REL]   active '%s' node 0x%08X: %s\n", a.desc->name, a.info,
+                     why ? why : "valid");
+    }
+    std::fflush(stderr);
 }
 
 }  // namespace gcrecomp

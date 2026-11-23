@@ -165,6 +165,10 @@ every DOL code address that a module relocation names (calls, branches, address 
    `ICInvalidateRange` (the replacement now forwards it) over a module's sections drops the activation immediately.
 5. An address inside a linked, recognised module that is not a recompiled entry prints module name, section and offset
    instead of a bare address.
+6. Calls the registry cannot serve are bounded: `GCRECOMP_UNRESOLVED_LIMIT` (default 1000) calls to one address stop
+   the run with the module list, the activations and the guest heaps printed. If the module list itself was clobbered
+   (a file read into guest address 0 after a failed allocation did that once: docs/DEBUGGING.md, "Heap exhaustion")
+   the registry reports an empty list rather than serving stale functions; `GCRECOMP_TRACE_REL=1` traces activations.
 
 ## Tests
 

@@ -39,6 +39,53 @@ is headed `// ---- section S +0xOFF ----`, so the offset can be looked up there)
 `... (no recompiled module has this signature)` means the guest linked a REL that was not given to
 `gcrecomp_recompiler --rel`. See docs/REL_MODULES.md.
 
+`GCRECOMP_TRACE_REL=1` prints every activation (with the section bases and the guest heap state), every drop of an
+activation (and why: node gone from the guest list, sections moved) and every `ICInvalidateRange` while a module is
+active.
+
+## Failing loudly (hangs, panics, heap exhaustion)
+
+A console halts in `OSPanic` and a game that jumps to garbage crashes. A recompiled game that is allowed to carry on
+does neither: it spins at hundreds of millions of memory operations a second with nothing on screen. The runtime now
+stops instead, with a diagnosis, and exits with status 70:
+
+* `OSPanic` prints `[GameCube PANIC] file:line: message`, the guest call chain (`[stack] lr=... <- ...`), the guest SDK
+  heaps (below) and `[FATAL]`. `GCRECOMP_PANIC_CONTINUE=1` restores the old "print and return" behaviour.
+* After `GCRECOMP_UNRESOLVED_LIMIT` (default 1000, 0 = never) calls to one address that neither the DOL table nor a
+  linked module serves, `FuncTable::call` prints the address, its module (or that it is in none), the guest module list
+  with the validity of every activation (`rel_dump_state`), the call chain and the heaps, then stops.
+
+| Variable | Effect |
+| --- | --- |
+| `GCRECOMP_GUEST_HEAP=ARRAY:NUM:CURR` | Where the game's SDK keeps its heap state, as signed offsets from r13 (`HeapArray`, `NumHeaps`, `__OSCurrHeap`; Tales of Symphonia: `-30536:-30532:-32248`). Needed by every heap dump; find the offsets in the game's `OSInitAlloc` (the first two stores of r3 and r5). |
+| `GCRECOMP_TRACE_HEAP=1` / `2` | A summary of every heap (size, free and allocated cells and bytes, largest block) at every `DVDOpen`; `2` adds the 16 biggest allocated blocks with their guest addresses. Compare the runs of two scenes: a heap that never recovers is a leak, one that is merely too small is a layout difference. |
+| `GCRECOMP_TRACE_REL=1` | See "REL modules" above. |
+| `GCRECOMP_UNRESOLVED_LIMIT=N` | See above. |
+| `GCRECOMP_PANIC_CONTINUE=1` | `OSPanic` returns instead of stopping. |
+| `GCRECOMP_ARENA_HI=0xADDR` | Overrides the arena's high bound (below). |
+
+### Heap exhaustion: the arena's high bound
+
+The symptom (Tales of Symphonia, the first boss of the Iselia temple): a nearly black frame, no more input, `[GameCube
+PANIC] GCSYS.c:1958` (the game's `malloc` got NULL from `OSAllocFromHeap`) and `FQNEW:ERROR` in the log, then
+`[FuncTable] Unresolved call` to the first function of the battle module and, once the log was 1 MB long, `Bad address`
+lines. The chain was: the allocation failed, `OSPanic` returned, the game read a file into the NULL buffer (guest
+address 0 is physical RAM: the OS globals, among them the REL module list at `0x800030C8`), the registry found no
+module any more and the calls into it were unresolved. The module registry was innocent; the cause was memory.
+
+The game creates its battle heap as `OSCreateHeap(0x81200000, OSGetArenaHi())`. The arena's high bound is not a free
+parameter: on a console the apploader loads the disc's FST at the very top of RAM and `OSInit` starts the arena just
+below it (boot.bin offset `0x42C` is the FST's maximum size: `0x9EC4` for this disc, so `0x817F6120`). A fixed
+`GameConfig::arena_hi = 0x81700000` made that heap 5 242 880 bytes instead of 6 250 784: 1 MB short. The boss itself was
+not replayed (the save is before the temple); at an ordinary battle the heap has 2.3 MB free before the background is
+extracted and 1.1 MB after, so a battle with more party members and a larger background plausibly needs more than the
+short heap holds. With the bound derived the same battle keeps 2.1 MB free. Give `GameConfig::fst_max_size`
+(`disc_fst_max_size()` reads it
+from boot.bin) and `init_low_memory()` derives the bound; `GCRECOMP_ARENA_HI` overrides it for experiments. How the
+numbers were found: `GCRECOMP_TRACE_HEAP=2` at a normal battle showed the battle heap at 5 MB with 2.3 MB free before
+the background is extracted and 1.1 MB after, and `GCRECOMP_WATCH` on the two biggest cells with `tools/guest-watch.py`
+named the module's prolog and `func_9003F2F4` as the allocators of fixed 632 KB and 1 MB blocks.
+
 ## Tools
 
 * `tools/benchmark.py`: frames per second per scene, VI throttling, CPU use and a `perf` profile of a scripted run (docs/BENCHMARK.md).

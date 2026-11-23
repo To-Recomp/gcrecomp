@@ -101,6 +101,13 @@ struct GameConfig {
     // These defaults cover a typical GameCube layout; override per-game/platform.
     uint32_t arena_lo = 0x80400000;
     uint32_t arena_hi = 0x81700000;
+
+    // Maximum size of the disc's file system table (boot.bin offset 0x42C, see disc_fst_max_size()). On a console the
+    // apploader loads the FST at the very top of RAM and the SDK's OSInit takes the arena's high bound from it:
+    // arena_hi = (RAM top - fst_max_size) rounded down to 32 bytes. When non-zero, init_low_memory() derives arena_hi
+    // that way and `arena_hi` above is ignored. Games size their heaps from OSGetArenaHi(): a fixed value that is
+    // too low (the 0x81700000 above) leaves them up to a megabyte short (docs/DEBUGGING.md, "Heap exhaustion").
+    uint32_t fst_max_size = 0;
 };
 
 // =============================================================================
@@ -508,6 +515,30 @@ std::string rel_describe(uint32_t gc_addr);
 // Forgets every activation, keeping the registered modules (tests that relink a module).
 void rel_reset_active();
 
+// -----------------------------------------------------------------------------
+// Loud failures (src/runtime/diagnostics.cpp, docs/DEBUGGING.md)
+// -----------------------------------------------------------------------------
+// Where the game's SDK keeps its OSAlloc state: offsets from r13 of `HeapArray`, `NumHeaps`, `__OSCurrHeap`.
+struct GuestHeapLayout {
+    int32_t array_off;
+    int32_t num_off;
+    int32_t curr_off;
+};
+void set_guest_heap_layout(const GuestHeapLayout& layout);  // or GCRECOMP_GUEST_HEAP=ARRAY_OFF:NUM_OFF:CURR_OFF
+bool guest_heap_known();
+// Prints every heap of the guest SDK: size, free and allocated cells and bytes (verbose: the biggest blocks).
+void dump_guest_heaps(const char* why, const PPCContext* ctx, bool verbose);
+// Prints LR and the saved return addresses up the guest stack.
+void print_guest_backtrace(const PPCContext* ctx);
+// Flushes the logs, prints "[FATAL] reason" and exits with status 70.
+[[noreturn]] void fatal_stop(const char* reason);
+// Stop after this many unresolved calls to one address (default 1000, env GCRECOMP_UNRESOLVED_LIMIT, 0 = never).
+void set_unresolved_limit(unsigned limit);
+// Tests: a handler called by fatal_stop before it exits (it may throw); nullptr restores the plain exit.
+void set_fatal_handler(void (*handler)(const char* reason));
+// Prints the guest module list, the recompiled modules and the activations (diagnostics).
+void rel_dump_state();
+
 // Last-dispatch probe, for diagnosing hangs.
 //
 // call() records every dispatch here. A watchdog can sample this: if the
@@ -620,6 +651,13 @@ void runtime_shutdown();
 // bounds, console type, boot magic, main thread). Must be called before
 // the game's OSInit or main entry point.
 void init_low_memory(Memory* mem, const GameConfig& config);
+
+// The arena's high bound of a console that boots a disc whose FST may be `fst_max_size` bytes (boot.bin 0x42C): the
+// apploader puts the FST at the top of RAM and OSInit starts the arena just below it.
+uint32_t arena_hi_for_fst(uint32_t ram_size, uint32_t fst_max_size);
+
+// Reads the FST maximum size from a disc's boot.bin (sys/boot.bin of an extracted disc); 0 when the file cannot be read.
+uint32_t disc_fst_max_size(const char* boot_bin_path);
 
 // The video standard (hw::OS_TV_FORMAT_*) of a console that plays a disc of this region: the fourth character of the game
 // ID (E USA, J Japan, K Korea, W Taiwan: NTSC; P, D, F, I, S, H, U, X, Y, Z, R: PAL). init_low_memory() stores it.
