@@ -86,6 +86,12 @@ numbers were found: `GCRECOMP_TRACE_HEAP=2` at a normal battle showed the battle
 the background is extracted and 1.1 MB after, and `GCRECOMP_WATCH` on the two biggest cells with `tools/guest-watch.py`
 named the module's prolog and `func_9003F2F4` as the allocators of fixed 632 KB and 1 MB blocks.
 
+### Writing tests
+
+Tests must build on MSVC (a CI job builds them on Windows). Set environment variables with `set_env` / `unset_env` from
+`tests/test_env.h`, not `setenv` / `unsetenv`, and keep POSIX-only calls (`unistd.h`, `mkdtemp`, `fork`, `getpid`,
+`sleep`) out of `tests/`; use `std::filesystem::temp_directory_path()` for scratch files.
+
 ## Tools
 
 * `tools/benchmark.py`: frames per second per scene, VI throttling, CPU use and a `perf` profile of a scripted run (docs/BENCHMARK.md).

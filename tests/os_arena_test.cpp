@@ -8,9 +8,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <filesystem>
 
 #include "gcrecomp/hw/gc_hw.h"
 #include "gcrecomp/runtime.h"
+#include "test_env.h"
 
 using namespace gcrecomp;
 
@@ -29,7 +31,7 @@ int main() {
         std::printf("memory init failed\n");
         return 1;
     }
-    unsetenv("GCRECOMP_ARENA_HI");
+    unset_env("GCRECOMP_ARENA_HI");
 
     // Tales of Symphonia: FST max size 0x9EC4 -> 0x817F6120 (rounded down to 32 bytes).
     CHECK_EQ(arena_hi_for_fst(24 * 1024 * 1024, 0x9EC4), 0x817F6120);
@@ -45,14 +47,13 @@ int main() {
     init_low_memory(&g_mem, config);
     CHECK_EQ(g_mem.read32(hw::OS_ARENA_HI), 0x817F6120);
 
-    setenv("GCRECOMP_ARENA_HI", "0x81780000", 1);
+    set_env("GCRECOMP_ARENA_HI", "0x81780000");
     init_low_memory(&g_mem, config);
     CHECK_EQ(g_mem.read32(hw::OS_ARENA_HI), 0x81780000);                // the experiment override wins
-    unsetenv("GCRECOMP_ARENA_HI");
+    unset_env("GCRECOMP_ARENA_HI");
 
     // boot.bin: the FST max size is the big-endian word at 0x42C.
-    const char* tmp = std::getenv("TMPDIR");
-    std::string file = std::string(tmp && *tmp ? tmp : "/tmp") + "/gcrecomp_os_arena_test.bin";
+    const std::string file = (std::filesystem::temp_directory_path() / "gcrecomp_os_arena_test.bin").string();
     {
         FILE* f = std::fopen(file.c_str(), "wb");
         if (!f) {
