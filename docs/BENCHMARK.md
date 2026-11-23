@@ -221,3 +221,15 @@ state is identical into one `glDrawArrays`: the vertices are transformed on the 
 (2) a vertex with only the texture coordinate sets in use (the 144-byte vertex is memmove traffic); (3) the SIMD or table-driven lighting;
 (4) moving the EFB read-back off the critical path where the CPU never reads the copy. A GP stream record/replay (headless, no CPU) would
 allow profiling these offline; not built yet.
+
+### Skipping the register translation of an unchanged state
+
+`apply_state` rebuilt the 16 TEV stage words, blend, fog, viewport and scissor state for every draw. `State::gen` now counts the writes that can change that
+state (a BP register whose value changes, a TLUT load, an XF load that touches the viewport words) and the renderer translates only when it moved since the last
+draw (textures are still validated per draw; an EFB copy or the early-Z replay forces a new translation). `GP_APPLY_ALWAYS=1` restores the old behaviour for comparing.
+
+`tos-vidarr.txt`, same machine (iGPU, see above), one run each: soldier battle main-thread CPU 67% -> 59 to 62% at 59.8 fps; boss fight 43.0 -> 44.3 fps (mean), per
+frame in the 30 fps stretches `renderer::draw` 5.6 -> 6.0 ms (unchanged, noise) and in heavy 60 fps frames 3.2 -> 3.0 ms; so the 30 fps frames change state
+at almost every draw and gain nothing, which also rules out merging identical-state draws as the cure for them. Pictures: `GP_APPLY_ALWAYS` against the default on the scripted
+scene, RMSE 0.00 to 0.73 (only the idle sway of the characters differs between two runs, the difference image shows edges only).
+What is left in the boss profile (perf): `Parser::draw` (vertex decode and transform) 20%, `light_vertex` + `light_factor` + `transform_normal` 9%, the Mesa glthread 12%, `memmove` 5%.

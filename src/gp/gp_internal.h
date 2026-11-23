@@ -33,6 +33,10 @@ struct State {
     // BP (raster, TEV, texture, blend, copy): 256 registers of 24 bits.
     uint32_t bp[256] = {};
 
+    // Bumped whenever a BP register, a TEV colour, a TLUT or the XF viewport changes: lets the renderer skip translating
+    // an unchanged state for every draw.
+    uint32_t gen = 0;
+
     float xf_float(uint32_t addr) const;
 };
 

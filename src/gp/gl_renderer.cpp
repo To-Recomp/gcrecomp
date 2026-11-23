@@ -536,14 +536,38 @@ struct Shadow {
     UniformShadow<3> fog_color;
 } g_sh;
 
-void invalidate_shadow() { g_sh = Shadow(); }
+// State::gen the last apply_state sent to GL (~0u: unknown). The register state applied to GL is a function of the BP
+// registers, the TEV colours and the XF viewport, all of which bump State::gen when they change (gp_parser.cpp), so
+// a draw that follows another with nothing written in between skips the whole translation; the textures are still
+// validated per draw, the guest may have rewritten one.
+uint32_t g_applied_gen = ~0u;
+bool g_used_maps[8] = {};  // maps the applied TEV stages sample
+
+void invalidate_shadow() {
+    g_sh = Shadow();
+    g_applied_gen = ~0u;
+}
 
 template <size_t N>
 bool same(const GLint (&a)[N], const GLint (&b)[N]) {
     return std::memcmp(a, b, sizeof a) == 0;
 }
 
+void apply_register_state(const State& s);
+
 void apply_state(const State& s) {
+    // GP_APPLY_ALWAYS=1: translate the register state for every draw (to compare pictures with and without the skip).
+    static const bool always = std::getenv("GP_APPLY_ALWAYS") != nullptr;
+    if (always || s.gen != g_applied_gen) apply_register_state(s);
+    // Textures: bind the maps the stages use; the others get the white texture. (The samplers u_tex0..7 are set to
+    // their units once, in init.)
+    for (int m = 0; m < 8; ++m) {
+        if (g_used_maps[m]) texture_for_map(s, m);
+        else bind_unit_texture(m, g_white);
+    }
+}
+
+void apply_register_state(const State& s) {
     // Viewport and scissor, in EFB coordinates (origin top-left) converted to GL (origin bottom-left).
     const float wd = s.xf_float(0x101A), ht = s.xf_float(0x101B), xo = s.xf_float(0x101D), yo = s.xf_float(0x101E);
     const float x_off = float((s.bp[0x59] & 0x3FF) * 2), y_off = float(((s.bp[0x59] >> 10) & 0x3FF) * 2);
@@ -716,15 +740,10 @@ void apply_state(const State& s) {
     if (g_sh.fog_i.changed(fog_i)) glUniform4i(g_loc.fog_i, fog_i[0], fog_i[1], fog_i[2], fog_i[3]);
     if (g_sh.fog_color.changed(fog.color)) glUniform3fv(g_loc.fog_color, 1, fog.color);
 
-    // Textures: bind the maps the stages use; the others get the white texture. (The samplers u_tex0..7 are set to
-    // their units once, in init.)
-    bool used[8] = {};
+    for (int m = 0; m < 8; ++m) g_used_maps[m] = false;
     for (int i = 0; i < nstages; ++i)
-        if ((stage[i][2] >> 6) & 1) used[stage[i][2] & 7] = true;
-    for (int m = 0; m < 8; ++m) {
-        if (used[m]) texture_for_map(s, m);
-        else bind_unit_texture(m, g_white);
-    }
+        if ((stage[i][2] >> 6) & 1) g_used_maps[stage[i][2] & 7] = true;
+    g_applied_gen = s.gen;
 }
 
 void print_feature_use() {
@@ -1036,6 +1055,7 @@ void draw(const DrawCall& call, const State& s) {
         glUniform2ui(g_loc.alpha_cmp, 7u | (7u << 3), 0u);
         g_sh.color_mask = -1;  // the next apply_state restores both
         g_sh.alpha_cmp.valid = false;
+        g_applied_gen = ~0u;  // the next draw translates the state again
         glDrawArrays(mode, first, GLsizei(count));
     }
 }
