@@ -6,6 +6,7 @@
 #include <cstring>
 #include <vector>
 
+#include "gcrecomp/gx/gx.h"
 #include "gp_decode.h"
 
 using namespace gcrecomp::gp;
@@ -82,6 +83,68 @@ static void test_c8_still_works() {
     const std::vector<uint8_t> tlut = make_tlut(0);
     const std::vector<uint8_t> out = decode_indexed(tlut.data(), tlut.size(), src.data(), 8, 4, kTexC8, 2u << 10);
     for (uint32_t i = 0; i < 32; ++i) CHECK(out[i * 4 + 2] == (i & 15) * 17);
+}
+
+// The first implementation of decode_indexed, kept as the reference: indices through the intensity decoders (or the C14X2 walk),
+// then one palette conversion per texel. The table-driven decoder must give the same bytes for every size, format and palette.
+namespace gcrecomp::gx {
+std::vector<uint8_t> decode_texture(const uint8_t* src, uint32_t width, uint32_t height, GXTexFmt fmt);
+}
+static std::vector<uint8_t> reference_decode_indexed(const uint8_t* tlut, size_t tlut_size, const uint8_t* src, uint32_t w, uint32_t h,
+                                                     uint32_t fmt, uint32_t settlut) {
+    const size_t texels = size_t(w) * h;
+    std::vector<uint16_t> idx(texels);
+    if (fmt == kTexC14X2) {
+        const uint32_t tiles_x = (w + 3) / 4, tiles_y = (h + 3) / 4;
+        for (uint32_t ty = 0; ty < tiles_y; ++ty)
+            for (uint32_t tx = 0; tx < tiles_x; ++tx) {
+                const uint8_t* tile = src + (size_t(ty) * tiles_x + tx) * 32;
+                for (uint32_t y = 0; y < 4; ++y)
+                    for (uint32_t x = 0; x < 4; ++x) {
+                        const uint32_t px = tx * 4 + x, py = ty * 4 + y;
+                        if (px < w && py < h)
+                            idx[size_t(py) * w + px] = uint16_t(((tile[(y * 4 + x) * 2] << 8) | tile[(y * 4 + x) * 2 + 1]) & 0x3FFF);
+                    }
+            }
+    } else {
+        const bool c4 = fmt == kTexC4;
+        const std::vector<uint8_t> raw = gcrecomp::gx::decode_texture(src, w, h, c4 ? gcrecomp::gx::GX_TF_I4 : gcrecomp::gx::GX_TF_I8);
+        for (size_t p = 0; p < texels; ++p) idx[p] = c4 ? raw[p * 4] / 17 : raw[p * 4];
+    }
+    const size_t base = size_t(settlut & 0x3FF) * 512;
+    const uint32_t pal_fmt = (settlut >> 10) & 3;
+    std::vector<uint8_t> out(texels * 4, 0);
+    for (size_t p = 0; p < texels; ++p) {
+        const size_t off = base + size_t(idx[p]) * 2;
+        if (off + 2 > tlut_size) continue;
+        tlut_entry_to_rgba(uint32_t(tlut[off] << 8) | tlut[off + 1], pal_fmt, &out[p * 4]);
+    }
+    return out;
+}
+
+static void test_indexed_matches_reference() {
+    uint32_t seed = 12345;
+    auto rnd = [&seed] {
+        seed = seed * 1664525u + 1013904223u;
+        return seed >> 8;
+    };
+    const uint32_t sizes[][2] = {{1, 1}, {5, 3}, {8, 4}, {13, 9}, {16, 16}, {64, 64}, {100, 90}, {130, 7}};
+    for (uint32_t fmt : {uint32_t(kTexC4), uint32_t(kTexC8), uint32_t(kTexC14X2)}) {
+        for (const auto& sz : sizes) {
+            const uint32_t w = sz[0], h = sz[1];
+            std::vector<uint8_t> src(texture_bytes(w, h, fmt));
+            for (uint8_t& b : src) b = uint8_t(rnd());
+            // A TLUT shorter than the largest index (C14X2 reaches 16384 entries): the entries past its end read as nothing.
+            std::vector<uint8_t> tlut(1024 * 2 + (fmt == kTexC14X2 ? 6000 : 700));
+            for (uint8_t& b : tlut) b = uint8_t(rnd());
+            for (uint32_t pal_fmt = 0; pal_fmt < 3; ++pal_fmt) {
+                const uint32_t settlut = (rnd() % 3) | (pal_fmt << 10);  // TLUT offset 0..2 units of 512 bytes
+                const std::vector<uint8_t> want = reference_decode_indexed(tlut.data(), tlut.size(), src.data(), w, h, fmt, settlut);
+                const std::vector<uint8_t> got = decode_indexed(tlut.data(), tlut.size(), src.data(), w, h, fmt, settlut);
+                CHECK(want == got);
+            }
+        }
+    }
 }
 
 static void test_mip_levels() {
@@ -292,6 +355,7 @@ int main() {
     test_c14x2();
     test_c14x2_out_of_range();
     test_c8_still_works();
+    test_indexed_matches_reference();
     test_mip_levels();
     test_mip_layout();
     test_lod_fields();

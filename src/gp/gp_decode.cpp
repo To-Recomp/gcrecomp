@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "gp_decode.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -53,23 +54,31 @@ void tlut_entry_to_rgba(uint32_t e, uint32_t pal_fmt, uint8_t out[4]) {
 
 namespace {
 
-// C14X2 stores one 16-bit big-endian entry per texel in 4x4 tiles; the low 14 bits are the index.
-std::vector<uint16_t> read_c14x2_indices(const uint8_t* src, uint32_t w, uint32_t h) {
-    std::vector<uint16_t> idx(size_t(w) * h);
-    const uint32_t tiles_x = (w + 3) / 4, tiles_y = (h + 3) / 4;
+// The TLUT as RGBA texels, one 32-bit word per entry (the bytes of an output pixel). An entry the TLUT memory does not hold
+// stays transparent black, as a texel pointing past the end of the TLUT always was.
+void build_palette(const uint8_t* tlut, size_t tlut_size, size_t base, uint32_t pal_fmt, size_t entries, uint32_t* pal) {
+    for (size_t i = 0; i < entries; ++i) {
+        const size_t off = base + i * 2;
+        uint8_t px[4] = {0, 0, 0, 0};
+        if (off + 2 <= tlut_size) tlut_entry_to_rgba(uint32_t(tlut[off] << 8) | tlut[off + 1], pal_fmt, px);
+        std::memcpy(&pal[i], px, 4);
+    }
+}
+
+// Walks the tiles of a palette format (`tw` x `th` texels per tile, 32 bytes each, tiles in rows left to right) and calls
+// put(x, y, tile, column, row) for each texel inside the image.
+template <typename Put>
+void for_each_texel(uint32_t w, uint32_t h, uint32_t tw, uint32_t th, const uint8_t* src, Put put) {
+    const uint32_t tiles_x = (w + tw - 1) / tw, tiles_y = (h + th - 1) / th;
     for (uint32_t ty = 0; ty < tiles_y; ++ty) {
+        const uint32_t rows = std::min(th, h - ty * th);
         for (uint32_t tx = 0; tx < tiles_x; ++tx) {
             const uint8_t* tile = src + (size_t(ty) * tiles_x + tx) * 32;
-            for (uint32_t y = 0; y < 4; ++y) {
-                for (uint32_t x = 0; x < 4; ++x) {
-                    const uint32_t px = tx * 4 + x, py = ty * 4 + y;
-                    if (px < w && py < h)
-                        idx[size_t(py) * w + px] = uint16_t(((tile[(y * 4 + x) * 2] << 8) | tile[(y * 4 + x) * 2 + 1]) & 0x3FFF);
-                }
-            }
+            const uint32_t cols = std::min(tw, w - tx * tw);
+            for (uint32_t r = 0; r < rows; ++r)
+                for (uint32_t c = 0; c < cols; ++c) put(tx * tw + c, ty * th + r, tile, c, r);
         }
     }
-    return idx;
 }
 
 }  // namespace
@@ -77,23 +86,43 @@ std::vector<uint16_t> read_c14x2_indices(const uint8_t* src, uint32_t w, uint32_
 std::vector<uint8_t> decode_indexed(const uint8_t* tlut, size_t tlut_size, const uint8_t* src, uint32_t w,
                                     uint32_t h, uint32_t fmt, uint32_t settlut) {
     const size_t texels = size_t(w) * h;
-    std::vector<uint16_t> idx(texels);
-    if (fmt == kTexC14X2) {
-        idx = read_c14x2_indices(src, w, h);
-    } else {
-        // C4 and C8 use the I4 and I8 tile layouts: decode as intensity to recover the indices.
-        const bool c4 = fmt == kTexC4;
-        const std::vector<uint8_t> raw = gx::decode_texture(src, w, h, c4 ? gx::GX_TF_I4 : gx::GX_TF_I8);
-        for (size_t p = 0; p < texels; ++p) idx[p] = c4 ? raw[p * 4] / 17 : raw[p * 4];
-    }
-
     const size_t base = size_t(settlut & 0x3FF) * 512;
     const uint32_t pal_fmt = (settlut >> 10) & 3;
     std::vector<uint8_t> out(texels * 4, 0);
-    for (size_t p = 0; p < texels; ++p) {
-        const size_t off = base + size_t(idx[p]) * 2;
-        if (off + 2 > tlut_size) continue;
-        tlut_entry_to_rgba(uint32_t(tlut[off] << 8) | tlut[off + 1], pal_fmt, &out[p * 4]);
+    uint8_t* const dst = out.data();
+    auto store = [&](uint32_t x, uint32_t y, uint32_t rgba) { std::memcpy(dst + (size_t(y) * w + x) * 4, &rgba, 4); };
+
+    if (fmt == kTexC14X2) {
+        // One 16-bit big-endian entry per texel in 4x4 tiles; the low 14 bits are the index. The whole palette is converted
+        // first when the image has about as many texels as it has entries, else only the entries that are used.
+        const bool table = texels >= 8192;
+        std::vector<uint32_t> pal(table ? 16384 : 0);
+        if (table) build_palette(tlut, tlut_size, base, pal_fmt, pal.size(), pal.data());
+        for_each_texel(w, h, 4, 4, src, [&](uint32_t x, uint32_t y, const uint8_t* tile, uint32_t c, uint32_t r) {
+            const uint32_t idx = ((tile[(r * 4 + c) * 2] << 8) | tile[(r * 4 + c) * 2 + 1]) & 0x3FFF;
+            if (table) {
+                store(x, y, pal[idx]);
+            } else {
+                uint32_t px;
+                build_palette(tlut, tlut_size, base + size_t(idx) * 2, pal_fmt, 1, &px);
+                store(x, y, px);
+            }
+        });
+    } else if (fmt == kTexC4) {
+        // The I4 tile layout: 8x8 texels, two per byte, the high nibble first.
+        uint32_t pal[16];
+        build_palette(tlut, tlut_size, base, pal_fmt, 16, pal);
+        for_each_texel(w, h, 8, 8, src, [&](uint32_t x, uint32_t y, const uint8_t* tile, uint32_t c, uint32_t r) {
+            const uint8_t byte = tile[r * 4 + c / 2];
+            store(x, y, pal[(c & 1) ? byte & 15 : byte >> 4]);
+        });
+    } else {
+        // C8, the I8 tile layout: 8x4 texels, one byte each.
+        uint32_t pal[256];
+        build_palette(tlut, tlut_size, base, pal_fmt, 256, pal);
+        for_each_texel(w, h, 8, 4, src, [&](uint32_t x, uint32_t y, const uint8_t* tile, uint32_t c, uint32_t r) {
+            store(x, y, pal[tile[r * 8 + c]]);
+        });
     }
     return out;
 }
