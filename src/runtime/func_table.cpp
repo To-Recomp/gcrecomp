@@ -214,6 +214,25 @@ static void trace_args(uint32_t gc_addr, const PPCContext* ctx, const Memory* me
     }
 }
 
+namespace {
+bool     g_unresolved_limit_set = false;
+unsigned g_unresolved_limit = 0;
+
+// GCRECOMP_UNRESOLVED_LIMIT=N: stop after N unresolved calls to the same address (default 1000, 0 = never).
+unsigned unresolved_limit_from_env() {
+    static const unsigned v = [] {
+        const char* e = std::getenv("GCRECOMP_UNRESOLVED_LIMIT");
+        return e && *e ? static_cast<unsigned>(std::strtoul(e, nullptr, 0)) : 1000u;
+    }();
+    return v;
+}
+}  // namespace
+
+void set_unresolved_limit(unsigned limit) {
+    g_unresolved_limit = limit;
+    g_unresolved_limit_set = true;
+}
+
 void FuncTable::call(uint32_t gc_addr, PPCContext* ctx, Memory* mem) const {
     if (gc_addr == 0) return; // Null function pointer — skip silently
 
@@ -247,6 +266,7 @@ void FuncTable::call(uint32_t gc_addr, PPCContext* ctx, Memory* mem) const {
         // Rate-limit unresolved call warnings
         static int unresolved_count = 0;
         static std::unordered_map<uint32_t, int> seen;
+        const unsigned limit = g_unresolved_limit_set ? g_unresolved_limit : unresolved_limit_from_env();
         unresolved_count++;
         int& addr_count = seen[gc_addr];
         addr_count++;
@@ -261,6 +281,18 @@ void FuncTable::call(uint32_t gc_addr, PPCContext* ctx, Memory* mem) const {
             printf("[FuncTable] %d total unresolved calls (%zu unique addresses)\n",
                     unresolved_count, seen.size());
             fflush(stdout);
+        }
+        // A guest that keeps calling an address nothing serves is running in garbage (see docs/DEBUGGING.md, "Failing
+        // loudly"): stop with a diagnosis instead of spinning at hundreds of millions of memory operations a second.
+        if (limit != 0 && addr_count >= limit) {
+            std::fprintf(stderr, "[FuncTable] %d calls to 0x%08X (LR=0x%08X) that nothing serves (limit %u)\n", addr_count,
+                         gc_addr, ctx->lr, limit);
+            const std::string where = rel_describe(gc_addr);
+            std::fprintf(stderr, "[FuncTable] address: %s\n", where.empty() ? "not inside a module the guest has linked" : where.c_str());
+            rel_dump_state();
+            print_guest_backtrace(ctx);
+            dump_guest_heaps("at unresolved-call limit", ctx, false);
+            fatal_stop("unresolved calls: the guest jumped to code the runtime does not have");
         }
     }
 }

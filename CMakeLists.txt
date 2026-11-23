@@ -46,6 +46,7 @@ if(GCRECOMP_BUILD_RUNTIME)
         src/runtime/memory.cpp
         src/runtime/func_table.cpp
         src/runtime/rel_modules.cpp
+        src/runtime/diagnostics.cpp
         src/runtime/interrupts.cpp
         src/os/os_funcs.cpp
         src/os/yaz0.cpp
@@ -394,5 +395,8 @@ if(GCRECOMP_BUILD_TESTS)
         add_executable(os_tv_format_test tests/os_tv_format_test.cpp)
         target_link_libraries(os_tv_format_test PRIVATE gcrecomp_runtime)
         add_test(NAME os_tv_format COMMAND os_tv_format_test)
+        add_executable(os_arena_test tests/os_arena_test.cpp)
+        target_link_libraries(os_arena_test PRIVATE gcrecomp_runtime)
+        add_test(NAME os_arena COMMAND os_arena_test)
     endif()
 endif()

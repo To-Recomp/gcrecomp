@@ -399,20 +399,19 @@ static void os_icache_invalidate(PPCContext* ctx, Memory* mem) {
 // Reference: libogc ogc/system.h
 // =============================================================================
 
+static std::string expand_guest_format(PPCContext* ctx, Memory* mem, const std::string& fmt, int first);
+
 static void os_report(PPCContext* ctx, Memory* mem) {
-    // OSReport(const char* fmt, ...)
-    // Note: variadic formatting is not fully supported; we print the format
-    // string as-is. Full printf emulation would require a vararg ABI shim.
+    // OSReport(const char* fmt, ...): the integer and string arguments are expanded (r4..r10); floating-point
+    // conversions stay visible as written.
     uint32_t fmt_addr = ctx->r[3];
-    char buf[512];
-    int i = 0;
-    while (i < 511) {
+    std::string fmt;
+    for (int i = 0; i < 511; ++i) {
         char c = (char)mem->read8(fmt_addr + i);
         if (c == 0) break;
-        buf[i++] = c;
+        fmt += c;
     }
-    buf[i] = 0;
-    printf("[GameCube] %s", buf);
+    printf("[GameCube] %s", expand_guest_format(ctx, mem, fmt, 4).c_str());
 }
 
 // Expands the printf-style message of a guest variadic call whose integer arguments start at GPR `first` (the PowerPC ABI
@@ -486,6 +485,13 @@ static void os_panic(PPCContext* ctx, Memory* mem) {
     std::string file = read_str(file_addr);
     std::string msg = expand_guest_format(ctx, mem, read_str(msg_addr), 6);
     fprintf(stderr, "[GameCube PANIC] %s:%u: %s\n", file.c_str(), line, msg.c_str());
+    // A console halts in OSPanic. Carrying on (e.g. after a failed allocation) makes the game read files into guest
+    // address 0 and spin in garbage: say what happened and stop (GCRECOMP_PANIC_CONTINUE=1 restores the old behaviour).
+    const char* cont = std::getenv("GCRECOMP_PANIC_CONTINUE");
+    if (cont && *cont && *cont != '0') return;
+    print_guest_backtrace(ctx);
+    dump_guest_heaps("at OSPanic", ctx, true);
+    fatal_stop("OSPanic: the game halted itself (docs/DEBUGGING.md, \"Failing loudly\"); GCRECOMP_PANIC_CONTINUE=1 to go on");
 }
 
 static void os_fatal(PPCContext* ctx, Memory* mem) {
@@ -747,6 +753,14 @@ static bool open_disc_file(const char* path, uint32_t info_addr, Memory* mem) {
     g_open_dvd_files[info_addr] = fp;
 
     printf("[DVD] Open: %s (%u bytes)\n", path, file_size);
+    {   // GCRECOMP_TRACE_HEAP=1 (summary) or 2 (with the biggest blocks): the game's heaps at every file open
+        // (docs/DEBUGGING.md, "Failing loudly")
+        static const int trace_heap = [] {
+            const char* v = std::getenv("GCRECOMP_TRACE_HEAP");
+            return v && *v ? std::atoi(v) : 0;
+        }();
+        if (trace_heap) dump_guest_heaps(path, &g_ctx, trace_heap >= 2);
+    }
     {
         std::lock_guard<std::mutex> lk(g_opened_mu);
         g_opened_files.push_back(path);
@@ -970,6 +984,19 @@ uint32_t os_tv_format_for_region(char region) {
     }
 }
 
+uint32_t arena_hi_for_fst(uint32_t ram_size, uint32_t fst_max_size) {
+    return (hw::MEM1_BASE + ram_size - fst_max_size) & ~31u;
+}
+
+uint32_t disc_fst_max_size(const char* boot_bin_path) {
+    FILE* f = std::fopen(boot_bin_path, "rb");
+    if (!f) return 0;
+    uint8_t b[4] = {0, 0, 0, 0};
+    const bool ok = std::fseek(f, 0x42C, SEEK_SET) == 0 && std::fread(b, 1, 4, f) == 4;
+    std::fclose(f);
+    return ok ? (uint32_t(b[0]) << 24) | (uint32_t(b[1]) << 16) | (uint32_t(b[2]) << 8) | b[3] : 0;
+}
+
 void init_low_memory(Memory* mem, const GameConfig& config) {
     printf("[OS] Initializing low memory (Dolphin OS boot state)...\n");
 
@@ -994,9 +1021,12 @@ void init_low_memory(Memory* mem, const GameConfig& config) {
     mem->write32(hw::OS_BUS_CLOCK, hw::BUS_CLOCK_HZ);
     mem->write32(hw::OS_CPU_CLOCK, hw::CPU_CLOCK_HZ);
 
-    // Arena bounds (initial -- the game's OSInit will adjust these)
+    // Arena bounds (initial -- the game's OSInit will adjust these). The high bound is where the FST starts, as on a
+    // console; GCRECOMP_ARENA_HI=0xADDR overrides it (experiments, docs/DEBUGGING.md).
+    uint32_t arena_hi = config.fst_max_size ? arena_hi_for_fst(config.ram_size, config.fst_max_size) : config.arena_hi;
+    if (const char* e = std::getenv("GCRECOMP_ARENA_HI"); e && *e) arena_hi = (uint32_t)std::strtoul(e, nullptr, 0);
     mem->write32(hw::OS_ARENA_LO, config.arena_lo);
-    mem->write32(hw::OS_ARENA_HI, config.arena_hi);
+    mem->write32(hw::OS_ARENA_HI, arena_hi);
 
     // Video standard: the IPL of a console sets it from its region and VIInit/VIConfigure read it. Left at 0 (NTSC) a PAL game
     // that asks VIConfigure for a PAL mode trips the SDK's "Tried to change mode from (0) to (1), which is forbidden" panic.

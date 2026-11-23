@@ -62,7 +62,7 @@ def main():
 
     pat = re.compile(r"^(\[watch\] #\d+ write(\d+) (0x[0-9A-Fa-f]+) = 0x[0-9A-Fa-f]+|\[bt\](?: #\d+)?()()) bt: (.*)$")
     counts = Counter()
-    for line in open(args.log) if args.log else sys.stdin:
+    for line in open(args.log, errors='replace') if args.log else sys.stdin:
         m = pat.match(line.rstrip("\n"))
         if not m:
             continue

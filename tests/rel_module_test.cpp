@@ -15,6 +15,11 @@
 
 using namespace gcrecomp;
 
+// The runtime's fatal stop, replaced by an exception the test can catch.
+struct FatalStop {};
+static bool g_threw = false;
+static void fatal_throws(const char*) { throw FatalStop(); }
+
 static int g_failures = 0;
 #define CHECK(cond)                                                                \
     do {                                                                           \
@@ -266,6 +271,33 @@ int main() {
     link_module(kLayout1);
     run_all(kLayout1, portable3);
     CHECK(portable1 == portable3);
+
+    // The root cause of the temple-boss hang: a failed allocation made the game read a file into guest address 0, which
+    // is the OS low memory. With the module list head overwritten, calls into the (intact) module are unresolved, the
+    // registry says so (empty description, no activation) and the unresolved-call bound stops the run.
+    {
+        const uint32_t head = g_mem.read32(kListHead), tail = g_mem.read32(kListTail);
+        const uint32_t target = kLayout1.base[1] + g_module.off.at("leaf");
+        CHECK_EQ(call(target, 1), 6);                         // linked and served
+        for (uint32_t a = 0x800030C0; a < 0x80003100; a += 4) g_mem.write32(a, 0x7C1174BF);   // file data over low memory
+        CHECK(rel_lookup(target) == nullptr);
+        CHECK(rel_describe(target).empty());
+        rel_dump_state();                                     // must cope with a garbage list
+
+        g_threw = false;
+        set_fatal_handler(fatal_throws);
+        set_unresolved_limit(20);
+        try {
+            for (int i = 0; i < 1000; ++i) call(target, 1);
+        } catch (const FatalStop&) {
+            g_threw = true;
+        }
+        CHECK(g_threw);                                       // bounded: stopped long before 1000 calls
+        set_fatal_handler(nullptr);
+        g_mem.write32(kListHead, head);
+        g_mem.write32(kListTail, tail);
+        CHECK_EQ(call(target, 1), 6);                         // the list is back: served again, no stale state
+    }
 
     if (g_failures == 0) std::printf("rel_module_test: all checks passed\n");
     return g_failures == 0 ? 0 : 1;
