@@ -133,6 +133,12 @@ constexpr uint32_t OS_RAM_END         = 0x800000EC;  // RAM end address
 // Memory size
 constexpr uint32_t OS_SIMULATED_MEM_SIZE = 0x800000F0; // Simulated mem size
 
+// Video standard of the console (OSTVFormat): the IPL writes it from the console's region; the SDK's VIInit and VIConfigure
+// read it (VIConfigure panics when a game asks for a mode of the other family). 0 NTSC, 1 PAL, 2 MPAL, 5 EuRGB60.
+constexpr uint32_t OS_TV_FORMAT       = 0x800000CC;
+constexpr uint32_t OS_TV_FORMAT_NTSC  = 0;
+constexpr uint32_t OS_TV_FORMAT_PAL   = 1;
+
 // DVD BI2 info
 constexpr uint32_t OS_BI2_ADDR        = 0x800000F4;  // bi2.bin address in RAM
 

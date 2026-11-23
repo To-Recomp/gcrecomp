@@ -621,6 +621,10 @@ void runtime_shutdown();
 // the game's OSInit or main entry point.
 void init_low_memory(Memory* mem, const GameConfig& config);
 
+// The video standard (hw::OS_TV_FORMAT_*) of a console that plays a disc of this region: the fourth character of the game
+// ID (E USA, J Japan, K Korea, W Taiwan: NTSC; P, D, F, I, S, H, U, X, Y, Z, R: PAL). init_low_memory() stores it.
+uint32_t os_tv_format_for_region(char region);
+
 // Register all OS HLE function replacements into an internal name-to-function
 // lookup table. Called during runtime_init().
 void register_os_functions();

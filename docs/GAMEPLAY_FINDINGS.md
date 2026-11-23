@@ -34,3 +34,30 @@ Every claim below comes from a run of the recompiled game with screenshots looke
   GP features the fight needs (indirect texturing, fog, z-compare) are therefore not looked at here.
 * **Speed**: the run is paced by the VI retrace and the guest timebase; a time-scale switch would shorten the
   iteration loop but is a change of the timebase model, not done here.
+
+## The `VIConfigure` panic (PAL game, `[GameCube PANIC] vi.c:1908`)
+
+Three times a session (boot and two scene changes) the log showed `VIConfigure(): Tried to change mode from (0) to (1), which
+is forbidden`. It was a real divergence from a console, harmless in effect:
+
+* The SDK's `VIConfigure` compares the video standard the console booted with (`OSTVFormat`, the word at 0x800000CC) with the
+  mode the game asks for (`viTVmode >> 2`): NTSC family (0 NTSC, 2 MPAL) and PAL family (1 PAL, 5 EuRGB60) must not mix. The
+  PAL disc asks for a PAL mode of its own (the render mode object the boot log prints: `viTVmode` 4 = PAL, interlaced; 640 wide,
+  EFB 449 lines, XFB 536 lines).
+* The word was 0: the IPL of a console writes it from its region and nothing wrote it here; and worse, `VIInit` reads the VI
+  display configuration register (0xCC002002, bit 0 = enabled), takes a disabled VI for a cold start and calls `__VIInit(NTSC)`,
+  which stores NTSC over `OSTVFormat` again. So the game believed it ran on an NTSC console and then asked for a PAL mode.
+* The panic returned (`OSPanic` is HLE) and `VIConfigure` carried on with the requested mode, so nothing else broke; the VI
+  model does not read the timing registers anyway.
+
+`init_low_memory` now stores the standard of the disc's region (fourth character of the game ID, `os_tv_format_for_region`) at
+0x800000CC and leaves the VI as the IPL does: enabled, in that format (0xCC002002), with display interrupt 0 enabled (VIInit then
+skips `__VIInit` and waits for the first retrace to flush its settings: without that interrupt the boot stalls). The panic is
+gone; the pictures of the village, the field and a battle are identical (`tools/frame_compare.py`, RMSE 0 on the scripted
+scenes). `OSPanic` also expands its `%d`/`%s` arguments now, which is how the two values (0 and 1) were found.
+
+Not changed, a known difference: on a real PAL console in PAL mode the retrace is 50 Hz; the VI clock here is always the NTSC
+59.94 Hz (`gcrecomp/vi.h`), so whatever the game paces by the retrace runs faster than on that console (not measured against a
+console). EuRGB60 (5)
+and progressive scan stay off (`OSGetEuRgb60Mode`, `OSGetProgressiveMode` return 0, a standard console as pinned in
+`tests/os_sound_mode_test.cpp`).

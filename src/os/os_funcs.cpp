@@ -415,6 +415,58 @@ static void os_report(PPCContext* ctx, Memory* mem) {
     printf("[GameCube] %s", buf);
 }
 
+// Expands the printf-style message of a guest variadic call whose integer arguments start at GPR `first` (the PowerPC ABI
+// passes the first eight integer arguments in r3..r10). Handles the conversions the SDK's own messages use (%d %i %u %x %X %c
+// %s %%, with width/precision and `l`); floating-point arguments (FPRs) are not expanded.
+static std::string expand_guest_format(PPCContext* ctx, Memory* mem, const std::string& fmt, int first) {
+    auto read_str = [&](uint32_t addr) {
+        std::string s;
+        for (int j = 0; j < 256; j++) {
+            char c = (char)mem->read8(addr + j);
+            if (c == 0) break;
+            s += c;
+        }
+        return s;
+    };
+    std::string out;
+    int arg = first;
+    for (size_t i = 0; i < fmt.size(); ++i) {
+        if (fmt[i] != '%') {
+            out += fmt[i];
+            continue;
+        }
+        std::string spec = "%";
+        ++i;
+        while (i < fmt.size() && (std::isdigit((unsigned char)fmt[i]) || fmt[i] == '-' || fmt[i] == '.' || fmt[i] == 'l')) {
+            if (fmt[i] != 'l') spec += fmt[i];
+            ++i;
+        }
+        if (i >= fmt.size()) break;
+        const char conv = fmt[i];
+        if (conv == '%') {
+            out += '%';
+            continue;
+        }
+        const uint32_t v = arg <= 10 ? ctx->r[arg] : 0;
+        char buf[64];
+        if (conv == 's') {
+            ++arg;
+            out += read_str(v);
+        } else if (conv == 'd' || conv == 'i') {
+            ++arg;
+            std::snprintf(buf, sizeof buf, (spec + "d").c_str(), int32_t(v));
+            out += buf;
+        } else if (conv == 'u' || conv == 'x' || conv == 'X' || conv == 'c') {
+            ++arg;
+            std::snprintf(buf, sizeof buf, (spec + conv).c_str(), v);
+            out += buf;
+        } else {
+            out += spec + conv;  // unsupported conversion: left visible
+        }
+    }
+    return out;
+}
+
 static void os_panic(PPCContext* ctx, Memory* mem) {
     // OSPanic(const char* file, int line, const char* msg, ...)
     uint32_t file_addr = ctx->r[3];
@@ -432,7 +484,7 @@ static void os_panic(PPCContext* ctx, Memory* mem) {
     };
 
     std::string file = read_str(file_addr);
-    std::string msg = read_str(msg_addr);
+    std::string msg = expand_guest_format(ctx, mem, read_str(msg_addr), 6);
     fprintf(stderr, "[GameCube PANIC] %s:%u: %s\n", file.c_str(), line, msg.c_str());
 }
 
@@ -909,6 +961,15 @@ static uint32_t g_main_thread_addr = 0;
 //   - GameCubeRecompiled: arena and thread initialization pattern
 // =============================================================================
 
+uint32_t os_tv_format_for_region(char region) {
+    switch (region) {
+        case 'P': case 'D': case 'F': case 'I': case 'S': case 'H': case 'U': case 'X': case 'Y': case 'Z': case 'R':
+            return hw::OS_TV_FORMAT_PAL;
+        default:  // E, J, K, W and anything unknown: NTSC, the state before this was written
+            return hw::OS_TV_FORMAT_NTSC;
+    }
+}
+
 void init_low_memory(Memory* mem, const GameConfig& config) {
     printf("[OS] Initializing low memory (Dolphin OS boot state)...\n");
 
@@ -936,6 +997,17 @@ void init_low_memory(Memory* mem, const GameConfig& config) {
     // Arena bounds (initial -- the game's OSInit will adjust these)
     mem->write32(hw::OS_ARENA_LO, config.arena_lo);
     mem->write32(hw::OS_ARENA_HI, config.arena_hi);
+
+    // Video standard: the IPL of a console sets it from its region and VIInit/VIConfigure read it. Left at 0 (NTSC) a PAL game
+    // that asks VIConfigure for a PAL mode trips the SDK's "Tried to change mode from (0) to (1), which is forbidden" panic.
+    const uint32_t tv_format = os_tv_format_for_region(config.game_id[3]);
+    mem->write32(hw::OS_TV_FORMAT, tv_format);
+    // The IPL also leaves the Video Interface enabled in that standard (VI_DISP_CONFIG: bit 0 enable, bits 8-9 format).
+    // VIInit treats a disabled VI as a cold start and calls __VIInit(NTSC), which stores NTSC (0) over OSTVFormat again.
+    mem->write16(vi::kRegBase + vi::kRegDispConfig, uint16_t(1 | (tv_format << 8)));
+    // And with the retrace interrupt running (display interrupt 0 enabled): VIInit then waits for the first retrace to flush
+    // its settings, which never comes if nothing enabled the interrupt, as __VIInit did on a cold start.
+    mem->write32(vi::kRegBase + vi::kRegDispInt0, vi::kDispIntEnb | (1u << 16) | 1u);
 
     // Boot magic (libogc writes 0x0D15EA5E at 0x80000020)
     mem->write32(hw::OS_BOOT_MAGIC, 0x0D15EA5E);
