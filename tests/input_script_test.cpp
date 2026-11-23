@@ -242,6 +242,25 @@ static void test_stick() {
     CHECK(s.parse("stick neutral hold=4", e));
 }
 
+static void test_stick_until_file() {
+    Host h("stick-until-file battle.cab down left every=10; press A hold=1");
+    h.tick();
+    CHECK(h.script.sticks().x == 0 && h.script.sticks().y == -100);  // the first direction, held until the next turn
+    for (int i = 0; i < 9; ++i) h.tick();                             // frame 10
+    CHECK(h.script.sticks().x == 0 && h.script.sticks().y == -100);
+    h.tick();                                                         // frame 11: the second direction starts
+    CHECK(h.script.sticks().x == -100 && h.script.sticks().y == 0);
+    for (int i = 0; i < 10; ++i) h.tick();                            // frame 21: back to the first
+    CHECK(h.script.sticks().x == 0 && h.script.sticks().y == -100);
+    h.pending_files = {"BTL/BTLbattle.CAB"};
+    CHECK(h.tick() == kA);  // the file ends the walk: the stick is released, the next command runs at once
+    CHECK(h.script.sticks().x == 0 && h.script.sticks().y == 0);
+    Script s;
+    std::string e;
+    CHECK(!s.parse("stick-until-file x", e) && !s.parse("stick-until-file x sideways", e) && !s.parse("stick-until-file x up every=0", e));
+    CHECK(s.parse("stick-until-file x up+right hold=5 every=30", e));
+}
+
 static void test_signature() {
     // Left half black, right half white.
     const int w = 64, h = 36;
@@ -275,6 +294,7 @@ int main() {
     test_trace_frame();
     test_log();
     test_stick();
+    test_stick_until_file();
     test_signature();
     if (g_failures) std::fprintf(stderr, "%d check(s) failed\n", g_failures);
     else std::puts("input script tests passed");

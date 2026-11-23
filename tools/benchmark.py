@@ -10,8 +10,11 @@ game opens, and prints one row per segment. See docs/BENCHMARK.md.
       --script tools/input-scripts/tos-new-game.txt --seconds 200 --out /var/tmp/bench1 \\
       [--perf field:25] [--label baseline] [--json result.json]
 
-Segments: `--segment NAME=SUBSTRING` (repeatable) starts segment NAME when the game opens a disc file whose path
-contains SUBSTRING (case-insensitive; the `[script] frame N: game opened PATH` lines of the log). The first segment,
+Segments: `--segment NAME=SUBSTRING` (repeatable, in the order the scene changes happen) starts segment NAME when the game
+opens a disc file whose path contains SUBSTRING (case-insensitive; the `[script] frame N: game opened PATH` lines of the
+log). `--segment NAME=cmd:TEXT` starts it when the script runs a command whose text contains TEXT instead (the
+`[script] frame N: COMMAND` lines): a `shot battle-start` command in the script is a marker for something the game does not
+announce with a file. The first segment,
 `boot`, starts with the run. Defaults are those of Tales of Symphonia with tos-new-game.txt (title, newgame = the
 save screens, movie = the 64 s movie before the opening, field = the opening cutscene in the classroom). `--perf NAME[:SECONDS]` records the host threads with `perf record` for SECONDS
 (default 20) starting 4 s into that segment and prints the profile grouped by what the code is (guest code, memory
@@ -83,6 +86,28 @@ def parse_bench(line):
     return out if "t" in out else None
 
 
+SCRIPT_LINE = re.compile(r"\[script\] frame (\d+): (.*)$")
+
+
+def marker_text(line):
+    """(frame, kind, text) of a `[script]` log line: kind "file" for a disc file the game opened, "cmd" for a script command."""
+    m = SCRIPT_LINE.match(line)
+    if not m:
+        return None
+    body = m.group(2)
+    if body.startswith("game opened "):
+        return int(m.group(1)), "file", body[len("game opened "):].strip().lower()
+    return int(m.group(1)), "cmd", body.strip().lower()
+
+
+def seg_hit(seg, kind, text):
+    """True when the log line (kind, text) starts segment `seg` = (name, substring); `cmd:` substrings match commands."""
+    sub = seg[1]
+    if sub.startswith("cmd:"):
+        return kind == "cmd" and sub[4:].strip() in text
+    return kind == "file" and sub in text
+
+
 def run_perf(pid, seconds, out_dir, name):
     data = os.path.join(out_dir, f"perf-{name}.data")
     cmd = ["perf", "record", "-F", "249", "-p", str(pid), "-o", data, "--", "sleep", str(seconds)]
@@ -108,7 +133,9 @@ def main():
     ap.add_argument("--script", action="append", required=True)
     ap.add_argument("--seconds", type=int, default=200, help="run length passed to the harness (default 200)")
     ap.add_argument("--out", default=os.path.join(os.environ.get("TMPDIR", "/tmp"), "bench"))
-    ap.add_argument("--segment", action="append", help="NAME=SUBSTRING (replaces the Tales of Symphonia defaults)")
+    ap.add_argument("--segment", action="append",
+                    help="NAME=SUBSTRING of a disc file path, or NAME=cmd:TEXT of a script command (replaces the Tales of Symphonia defaults)")
+    ap.add_argument("--card-in", help="start from a copy of this memory card image (a save) instead of a blank card")
     ap.add_argument("--perf", action="append", default=[], help="NAME[:SECONDS] profile of a segment")
     ap.add_argument("--perf-top", type=int, default=25)
     ap.add_argument("--label", default="")
@@ -149,6 +176,8 @@ def main():
         env[k] = v
     if os.path.exists(out + ".card"):
         os.remove(out + ".card")
+    if args.card_in:
+        shutil.copyfile(args.card_in, out + ".card")
 
     cmd = [os.path.abspath(args.bin), os.path.abspath(args.dol), os.path.abspath(args.files), str(args.seconds)]
     if not args.no_nice:
@@ -182,15 +211,14 @@ def main():
             lines = (carry + chunk).split("\n")
             carry = lines.pop()
             for ln in lines:
-                m = re.match(r"\[script\] frame (\d+): game opened (\S+)", ln)
-                if not m:
+                mt = marker_text(ln)
+                if not mt:
                     continue
-                path = m.group(2).lower()
-                while seg_index + 1 < len(segs) and segs[seg_index + 1][1] in path:
+                while seg_index + 1 < len(segs) and seg_hit(segs[seg_index + 1], mt[1], mt[2]):
                     seg_index += 1
                     name = segs[seg_index][0]
                     seg_start_wall[name] = time.time() - t_start
-                    markers.append((name, time.time() - t_start, int(m.group(1))))
+                    markers.append((name, time.time() - t_start, mt[0]))
                     if name in perf_req:
                         pending_perf = (name, time.time() + 4)
         if pending_perf and time.time() >= pending_perf[1]:
@@ -213,11 +241,10 @@ def main():
     seg_names = [s[0] for s in segs]
     with open(log_path, errors="replace") as f:
         for ln in f:
-            m = re.match(r"\[script\] frame \d+: game opened (\S+)", ln)
-            if m:
-                path = m.group(1).lower()
+            mt = marker_text(ln)
+            if mt:
                 i = seg_names.index(seg_now)
-                while i + 1 < len(segs) and segs[i + 1][1] in path:
+                while i + 1 < len(segs) and seg_hit(segs[i + 1], mt[1], mt[2]):
                     i += 1
                 seg_now = seg_names[i]
                 continue
@@ -234,7 +261,8 @@ def main():
     print(f"host load average (1 min): {load0:.1f} at start, {load1:.1f} at end ({os.cpu_count()} CPUs): a busy machine starves the "
           "nice'd game and shows as seconds with low cpu% and low idle%")
     print("time to marker (wall s since start): " + (", ".join(f"{n} {t:.0f}" for n, t, _ in markers) or "none"))
-    hdr = f"{'segment':9} {'secs':>5} {'fps':>6} {'min':>6} {'med':>6} {'retrace':>7} {'idle%':>5} {'cpu%':>5} {'disp/s':>8} {'memop/s':>8} {'draws/s':>8}  threads (CPU%)"
+    hdr = (f"{'segment':9} {'secs':>5} {'fps':>6} {'min':>6} {'med':>6} {'retrace':>7} {'idle%':>5} {'cpu%':>5} {'disp/s':>8} {'memop/s':>8} "
+           f"{'draws/s':>8} {'texdec/s':>8} {'texel/s':>8} {'hash B/s':>8} {'efbmem/s':>8}  threads (CPU%)")
     print(hdr)
     for name in seg_names:
         ss = [b for s, b in samples if s == name]
@@ -250,10 +278,13 @@ def main():
         # per-thread CPU of the middle sample
         thr = ss[len(ss) // 2].get("threads", "")
         row = dict(secs=dt, fps=statistics.mean(fps), fps_min=min(fps), fps_med=statistics.median(fps), retrace=avg("retrace"),
-                   idle=avg("idle"), cpu=avg("cpu"), dispatch=avg("dispatch"), memops=avg("memops"), draws=avg("draws"), threads=thr)
+                   idle=avg("idle"), cpu=avg("cpu"), dispatch=avg("dispatch"), memops=avg("memops"), draws=avg("draws"),
+                   texdec=avg("texdec"), texdec_indexed=avg("texdec_indexed"), textexels=avg("textexels"), texhash=avg("texhash"),
+                   texhash_bytes=avg("texhash_bytes"), efbmem=avg("efbmem"), efbmem_px=avg("efbmem_px"), threads=thr)
         result["segments"][name] = row
         print(f"{name:9} {dt:5d} {row['fps']:6.1f} {row['fps_min']:6.1f} {row['fps_med']:6.1f} {row['retrace']:7.1f} {row['idle']:5.0f} {row['cpu']:5.0f} "
-              f"{row['dispatch']/1e6:7.2f}M {row['memops']/1e6:7.1f}M {row['draws']:8.0f}  {thr}")
+              f"{row['dispatch']/1e6:7.2f}M {row['memops']/1e6:7.1f}M {row['draws']:8.0f} {row['texdec']:8.0f} {row['textexels']/1e6:7.2f}M "
+              f"{row['texhash_bytes']/1e6:7.1f}M {row['efbmem']:8.0f}  {thr}")
     print("fps = frames presented to the window (EFB copies to the XFB) per second of wall time; retrace = VI retraces per second\n"
           "(59.94 when the clock is kept); idle% = share of time every guest thread was blocked waiting for the retrace or an\n"
           "alarm (high = throttled by the VI clock, the game has CPU to spare; ~0 = flat out, the host is the limit).")

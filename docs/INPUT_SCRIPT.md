@@ -25,6 +25,7 @@ condition holds, `press` does not block (the button is held while later commands
 | `at N` | Waits until retrace frame `N` (1-based, counted from the start of the run). |
 | `stick X Y [hold=N]` / `stick DIR[+DIR...] [hold=N]` | Holds the main stick (`X`, `Y` in -128..127, y up; or `up`, `down`, `left`, `right` joined by `+`, which deflect to 100) for `N` frames (default 5): walking. `stick neutral` is a no-op that lasts `N` frames. |
 | `cstick ...` | Same for the C-stick (camera). |
+| `stick-until-file TEXT DIR[+DIR...]... [every=N] [hold=N]` | Like `press-until-file` for the main stick: every `N` frames (default 120) starts holding the next of the listed directions (held `hold` frames, default `N`: walking without a pause), in turn, until the game opens a matching file, then lets go of the stick. Walk in a square until a battle loads: `stick-until-file BTL/BTLlloyd.cab down left down right every=300 timeout=240`. |
 | `wait N` | Waits `N` retrace frames. |
 | `wait-seconds S` | Waits `S` seconds of wall time. |
 | `wait-presented N` | Waits until `N` more frames have been presented to the window. |
@@ -78,3 +79,4 @@ shot next
 * `tools/run-scripted.sh --script A --script B`: segments run in order; `--card-in FILE` starts from a given card image.
 * `tools/input-scripts/tos-classroom.txt`, `tos-first-walk.txt`, `tos-menu.txt`: the next segments (the classroom cutscene, walking, the field menu; the last one is exploratory).
 * `tools/input-scripts/tos-new-game.txt`: example, Tales of Symphonia from a blank card to the opening classroom scene (the first dialogue).
+* `tools/input-scripts/tos-battle.txt`: Tales of Symphonia from a save (`--card-in`: the memorial circle in Iselia) to a battle on the field map and through it; see docs/BENCHMARK.md ("A battle").
