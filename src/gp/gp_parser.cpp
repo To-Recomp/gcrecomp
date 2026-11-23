@@ -14,6 +14,7 @@
 #include <cstring>
 #include <vector>
 
+#include "gcrecomp/bench.h"
 #include "gcrecomp/runtime.h"
 #include "gp_internal.h"
 #include "lighting.h"
@@ -154,6 +155,17 @@ Layout make_layout(const State& s, uint32_t fmt) {
     return l;
 }
 
+// 2^-n for n = 0..31, exact: v * 2^-n equals v / 2^n.
+struct InvPow2 {
+    float v[32];
+    constexpr InvPow2() : v() {
+        float f = 1.0f;
+        for (int i = 0; i < 32; ++i, f *= 0.5f) v[i] = f;
+    }
+    constexpr float operator[](uint32_t i) const { return v[i]; }
+};
+constexpr InvPow2 kInvPow2;
+
 float read_component(const uint8_t* p, uint32_t fmt, uint32_t shift) {
     float v;
     switch (fmt) {
@@ -167,7 +179,7 @@ float read_component(const uint8_t* p, uint32_t fmt, uint32_t shift) {
             return v;
         }
     }
-    return shift ? v / float(1u << shift) : v;
+    return shift ? v * kInvPow2[shift & 31] : v;
 }
 
 void read_color(const uint8_t* p, uint32_t fmt, float out[4]) {
@@ -237,6 +249,22 @@ private:
     std::vector<float> vertices_;
     int dl_depth_ = 0;
 
+    // The layout of the last draw, reused while the registers it is made from are unchanged (a draw command follows
+    // thousands of others with the same vertex format).
+    Layout layout_cache_;
+    uint32_t layout_key_[5] = {};
+    bool layout_valid_ = false;
+    const Layout& cached_layout(uint32_t fmt) {
+        const State& st = g_state;
+        const uint32_t key[5] = {st.vcd_lo, st.vcd_hi, st.vat[0][fmt], st.vat[1][fmt], st.vat[2][fmt]};
+        if (!layout_valid_ || layout_cache_.fmt != fmt || std::memcmp(key, layout_key_, sizeof key) != 0) {
+            layout_cache_ = make_layout(st, fmt);
+            std::memcpy(layout_key_, key, sizeof key);
+            layout_valid_ = true;
+        }
+        return layout_cache_;
+    }
+
     // Returns the number of bytes consumed, or 0 when the command is not complete yet.
     size_t parse_one(const uint8_t* p, size_t n) {
         const uint8_t cmd = p[0];
@@ -305,7 +333,7 @@ private:
         if (cmd >= 0x80) {
             if (n < 3) return 0;
             const uint32_t count = be16(p + 1);
-            const Layout layout = make_layout(g_state, cmd & 7);
+            const Layout& layout = cached_layout(cmd & 7);
             const size_t total = 3 + size_t(count) * layout.size;
             if (n < total) {
                 want_ = total;
@@ -484,6 +512,7 @@ private:
         ++g_stats.draws;
         g_stats.vertices += count;
         if (!g_graphics) return;
+        bench::ScopedNs timer(g_render_stats.parse_ns);
 
         const State& s = g_state;
         vertices_.resize(size_t(count) * kVertexFloats);
@@ -552,6 +581,23 @@ private:
             base_tex_mtx[i] = i < 4 ? (s.matidx_a >> (6 * (i + 1))) & 0x3F : (s.matidx_b >> (6 * (i - 4))) & 0x3F;
         // The normal only matters when one of the four channel controls (XF 0x100E..0x1011) has lighting enabled.
         const bool lit = ((s.xf[0x100E] | s.xf[0x100F] | s.xf[0x1010] | s.xf[0x1011]) & 2) != 0;
+        // Indexed attribute arrays: the host address of each array once per draw (guest RAM is contiguous), not a
+        // translation per vertex and attribute.
+        const uint8_t* array_ptr[16] = {};
+        auto resolve = [&](AttrMode mode, uint32_t array) {
+            if (mode == kIndex8 || mode == kIndex16) array_ptr[array] = g_mem.read_ptr(s.array_base[array]);
+        };
+        resolve(l.pos, 0);
+        resolve(l.nrm, 1);
+        for (int c = 0; c < 2; ++c) resolve(l.col[c], 2 + c);
+        for (int t = 0; t < 8; ++t) resolve(l.tex[t], 4 + t);
+        // Texture coordinate generators: source row and projectivity of each, decoded once.
+        struct TexGen { uint32_t row; bool projective; uint32_t info; };
+        TexGen texgens[8] = {};
+        for (uint32_t i = 0; i < num_texgens && i < 8; ++i) {
+            const uint32_t info = s.xf[0x1040 + i];
+            texgens[i] = {(info >> 7) & 0x1F, bool((info >> 1) & 1), info};
+        }
         const uint8_t* p = data;
         for (uint32_t v = 0; v < count; ++v) {
             float* out = &vertices_[size_t(v) * kVertexFloats];
@@ -574,7 +620,7 @@ private:
                     index = be16(p);
                     p += 2;
                 }
-                return g_mem.read_ptr(s.array_base[array] + index * s.array_stride[array]);
+                return array_ptr[array] + size_t(index) * s.array_stride[array];
             };
 
             float pos[3] = {0, 0, 0};
@@ -635,13 +681,22 @@ private:
             const float zgc = cw != 0.0f ? cz / cw : 0.0f;
             const float depth = (far_z + zgc * z_range) / 16777215.0f;
             // Channel colors: material and ambient sources, lights (XF color/alpha channels).
-            float lit[2][4];
+            float shaded[2][4];
             float view_nrm[3] = {0, 0, 0};
             if (lit || trace) transform_normal(s.xf, pos_mtx, nrm, view_nrm);
-            light_vertex(s.xf, color, view, view_nrm, lit);
+            if (lit) {
+                light_vertex(s.xf, color, view, view_nrm, shaded);
+            } else {
+                // No channel lights: each component is its material source (what light_vertex returns for such a control).
+                for (int c = 0; c < 2; ++c) {
+                    const uint32_t cc = s.xf[0x100E + c], ac = s.xf[0x1010 + c];
+                    for (int i = 0; i < 3; ++i) shaded[c][i] = (cc & 1) ? color[c][i] : mat_color[c][i];
+                    shaded[c][3] = (ac & 1) ? color[c][3] : mat_color[c][3];
+                }
+            }
             if (trace && trace_n <= 60 && v == 0) {
                 std::fprintf(stderr, "[DRAW]   ndc=(%g %g %g) w=%g lit0=(%g %g %g %g) nrm=(%g %g %g) view_nrm=(%g %g %g) ctrl0=%X ctrl1=%X amb0=%08X mat0=%08X L0col=%08X L1col=%08X L0pos=(%g %g %g) L0dir=(%g %g %g) vcol=(%g %g %g %g)\n",
-                             cx / cw, cy / cw, zgc, cw, lit[0][0], lit[0][1], lit[0][2], lit[0][3], nrm[0], nrm[1], nrm[2], view_nrm[0], view_nrm[1], view_nrm[2], s.xf[0x100E], s.xf[0x1010],
+                             cx / cw, cy / cw, zgc, cw, shaded[0][0], shaded[0][1], shaded[0][2], shaded[0][3], nrm[0], nrm[1], nrm[2], view_nrm[0], view_nrm[1], view_nrm[2], s.xf[0x100E], s.xf[0x1010],
                              s.xf[0x100A], s.xf[0x100C], s.xf[0x603 + 0], s.xf[0x603 + 16], s.xf_float(0x60A), s.xf_float(0x60B), s.xf_float(0x60C),
                              s.xf_float(0x60D), s.xf_float(0x60E), s.xf_float(0x60F), color[0][0], color[0][1], color[0][2], color[0][3]);
             }
@@ -660,7 +715,7 @@ private:
                 (void)verts_parsed;
                 if ((trace_n >= verts_first && trace_n <= verts_last) || (verts_ortho && ortho))
                     std::fprintf(stderr, "[VERT] #%d v%u pos=(%g %g %g) col0=(%g %g %g %g) lit0=(%g %g %g %g) st0=(%g %g)\n", trace_n, v, pos[0], pos[1], pos[2],
-                                 color[0][0], color[0][1], color[0][2], color[0][3], lit[0][0], lit[0][1], lit[0][2], lit[0][3], st[0][0], st[0][1]);
+                                 color[0][0], color[0][1], color[0][2], color[0][3], shaded[0][0], shaded[0][1], shaded[0][2], shaded[0][3], st[0][0], st[0][1]);
             }
             if (trace && trace_n <= 3 && v < 4) {
                 std::fprintf(stderr, "[DRAW]   v%u mtx=%u pos=(%g %g %g) view=(%g %g %g) clip=(%g %g %g %g) rows:", v, pos_mtx, pos[0], pos[1], pos[2], view[0], view[1], view[2], cx, cy, cz, cw);
@@ -671,8 +726,8 @@ private:
             out[1] = cy;
             out[2] = (2.0f * depth - 1.0f) * cw;
             out[3] = cw;
-            std::memcpy(out + 4, lit[0], sizeof(float) * 4);
-            std::memcpy(out + 8, lit[1], sizeof(float) * 4);
+            std::memcpy(out + 4, shaded[0], sizeof(float) * 4);
+            std::memcpy(out + 8, shaded[1], sizeof(float) * 4);
 
             // Texture coordinates: texgen i reads its source row and applies a 2x4 or 3x4 matrix.
             for (uint32_t i = 0; i < 8; ++i) {
@@ -680,9 +735,9 @@ private:
                 uv[0] = uv[1] = 0.0f;
                 uv[2] = 1.0f;
                 if (i >= num_texgens) continue;
-                const uint32_t info = s.xf[0x1040 + i];
-                const bool projective = (info >> 1) & 1;
-                const uint32_t row = (info >> 7) & 0x1F;
+                const uint32_t info = texgens[i].info;
+                const bool projective = texgens[i].projective;
+                const uint32_t row = texgens[i].row;
                 float src[4] = {0, 0, 1, 1};
                 if (row == 0) {
                     src[0] = pos[0]; src[1] = pos[1]; src[2] = pos[2]; src[3] = 1;

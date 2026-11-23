@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "gcrecomp/bench.h"
 #include "gcrecomp/gx/gx.h"
 #include "gcrecomp/runtime.h"
 #include "efb_copy.h"
@@ -901,6 +902,10 @@ void shutdown() {
 }
 
 void draw(const DrawCall& call, const State& s) {
+    // GP_SKIP_DRAW=1: the draws are parsed and decoded but not given to GL (isolates the cost of the renderer and the GPU).
+    static const bool skip_draw = std::getenv("GP_SKIP_DRAW") != nullptr;
+    if (skip_draw) return;
+    bench::ScopedNs timer(g_render_stats.draw_ns);
     static uint64_t calls = 0;
     ++calls;
     static const bool gp_trace = std::getenv("GP_TRACE") != nullptr;
@@ -947,23 +952,9 @@ void draw(const DrawCall& call, const State& s) {
     const float* data = call.vertices;
     GLenum mode = GL_TRIANGLES;
     uint32_t count = call.vertex_count;
-    static std::vector<float> expanded;  // reused between draws
-    expanded.clear();
+    const bool quads = call.primitive == kQuads;
     switch (call.primitive) {
-        case kQuads: {
-            expanded.reserve(size_t(count) / 4 * 6 * kVertexFloats);
-            for (uint32_t q = 0; q + 3 < count; q += 4) {
-                static const int order[6] = {0, 1, 2, 0, 2, 3};
-                for (int k : order) {
-                    const float* v = data + size_t(q + k) * kVertexFloats;
-                    expanded.insert(expanded.end(), v, v + kVertexFloats);
-                }
-            }
-            data = expanded.data();
-            count = uint32_t(expanded.size() / kVertexFloats);
-            mode = GL_TRIANGLES;
-            break;
-        }
+        case kQuads: count = count / 4 * 6; break;  // two triangles per quad, written straight into the buffer below
         case kTriangles: mode = GL_TRIANGLES; break;
         case kTriangleStrip: mode = GL_TRIANGLE_STRIP; break;
         case kTriangleFan: mode = GL_TRIANGLE_FAN; break;
@@ -978,10 +969,26 @@ void draw(const DrawCall& call, const State& s) {
     constexpr size_t kVertexBytes = kVertexFloats * sizeof(float);
     constexpr size_t kRingBytes = (16u << 20) / kVertexBytes * kVertexBytes;  // a whole number of vertices
     static size_t ring_used = 0;
+    static std::vector<uint8_t> oversized;  // only for a draw larger than the ring
     const size_t bytes = size_t(count) * kVertexBytes;
+    // Copies the vertices to `dst`; quads become the triangles (0 1 2) (0 2 3), one vertex copy each.
+    auto fill = [&](uint8_t* dst) {
+        if (!quads) {
+            std::memcpy(dst, data, bytes);
+            return;
+        }
+        static const int order[6] = {0, 1, 2, 0, 2, 3};
+        for (uint32_t q = 0; q + 3 < call.vertex_count; q += 4)
+            for (int k : order) {
+                std::memcpy(dst, data + size_t(q + k) * kVertexFloats, kVertexBytes);
+                dst += kVertexBytes;
+            }
+    };
     GLint first = 0;
     if (bytes > kRingBytes) {
-        glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(bytes), data, GL_STREAM_DRAW);
+        oversized.resize(bytes);
+        fill(oversized.data());
+        glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(bytes), oversized.data(), GL_STREAM_DRAW);
         g_ring_valid = false;
     } else {
         if (!g_ring_valid || ring_used + bytes > kRingBytes) {
@@ -993,10 +1000,12 @@ void draw(const DrawCall& call, const State& s) {
         void* dst = glMapBufferRange(GL_ARRAY_BUFFER, GLsizeiptr(ring_used), GLsizeiptr(bytes),
                                      GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
         if (dst) {
-            std::memcpy(dst, data, bytes);
+            fill(static_cast<uint8_t*>(dst));
             glUnmapBuffer(GL_ARRAY_BUFFER);
         } else {
-            glBufferSubData(GL_ARRAY_BUFFER, GLsizeiptr(ring_used), GLsizeiptr(bytes), data);
+            oversized.resize(bytes);
+            fill(oversized.data());
+            glBufferSubData(GL_ARRAY_BUFFER, GLsizeiptr(ring_used), GLsizeiptr(bytes), oversized.data());
         }
         first = GLint(ring_used / kVertexBytes);
         ring_used += bytes;
@@ -1005,7 +1014,7 @@ void draw(const DrawCall& call, const State& s) {
     if (xhist) {
         static float minx = 1e9f, maxx = -1e9f, miny = 1e9f, maxy = -1e9f;
         static int frame_draws = 0;
-        for (uint32_t v = 0; v < count; ++v) {
+        for (uint32_t v = 0; v < call.vertex_count; ++v) {
             const float w = data[size_t(v) * kVertexFloats + 3];
             const float cx = data[size_t(v) * kVertexFloats] / w, cy = data[size_t(v) * kVertexFloats + 1] / w;
             minx = std::min(minx, cx); maxx = std::max(maxx, cx); miny = std::min(miny, cy); maxy = std::max(maxy, cy);
@@ -1055,10 +1064,14 @@ static void copy_efb_to_memory(const State& s, uint32_t copy_cmd) {
     static std::vector<uint32_t> depth;
     if (p.depth) {
         depth.resize(size_t(p.w) * p.h);
-        glReadPixels(p.x, gl_y, p.w, p.h, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, depth.data());
+        {
+            bench::ScopedNs timer(g_render_stats.readback_ns);
+            glReadPixels(p.x, gl_y, p.w, p.h, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, depth.data());
+        }
         for (uint32_t& d : depth) d >>= 8;
     } else {
         rgba.resize(size_t(p.w) * p.h * 4);
+        bench::ScopedNs timer(g_render_stats.readback_ns);
         glReadPixels(p.x, gl_y, p.w, p.h, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
     }
     // GL rows run bottom to top.
@@ -1087,6 +1100,7 @@ void copy_efb(const CopyRequest& r, const State& s) {
         ++g_render_stats.efb_copies_xfb;
         if (++presented % 600 == 0 && gp_trace) print_feature_use();
         // Blit the copied EFB region to the window and present.
+        bench::ScopedNs timer(g_render_stats.swap_ns);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         glDisable(GL_SCISSOR_TEST);

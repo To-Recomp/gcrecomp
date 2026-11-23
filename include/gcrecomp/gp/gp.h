@@ -63,6 +63,11 @@ struct RenderStats {
     uint64_t efb_copies_memory = 0;    // EFB-to-memory copies (read back and encoded)
     uint64_t efb_copy_pixels = 0;
     uint64_t efb_copies_xfb = 0;       // frames presented
+    // Wall nanoseconds spent in the renderer, measured only while GCRECOMP_BENCH is set (docs/BENCHMARK.md).
+    uint64_t parse_ns = 0;             // Parser::draw: vertex decode, transform, lighting, then renderer::draw
+    uint64_t draw_ns = 0;              // renderer::draw: state, vertex upload, glDrawArrays
+    uint64_t readback_ns = 0;          // glReadPixels of EFB-to-memory copies (the wait for the GPU)
+    uint64_t swap_ns = 0;              // blit and buffer swap of a presented frame
 };
 const RenderStats& render_stats();
 
