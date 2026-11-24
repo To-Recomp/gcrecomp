@@ -147,7 +147,10 @@ static void test_copy_features() {
     note_copy_features(b, 0x4000, id53, id54, false);
     CHECK(b.features.empty());  // identity filter, no gamma: nothing special
     note_copy_features(b, 0x4000, df53, df54, false);
-    CHECK(b.features.count("EFB copy vertical filter"));
+    CHECK(b.features.count("EFB copy vertical filter") && b.features["EFB copy vertical filter"].implemented);
+    Bundle unprogrammed;
+    note_copy_features(unprogrammed, 0x4000, 0, 0, false);  // taps never written: not a filtered copy
+    CHECK(unprogrammed.features.empty());
     note_copy_features(b, 0x4000 | (1u << 7), id53, id54, false);
     CHECK(b.features.count("EFB copy gamma") && !b.features["EFB copy gamma"].implemented);
     note_copy_features(b, 0x4000 | (1u << 9) | (1u << 10), id53, id54, false);

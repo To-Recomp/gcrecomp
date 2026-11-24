@@ -2,6 +2,7 @@
 // Round-trips synthetic images through encode_efb_copy and the existing decode_texture.
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 #include <vector>
 
 #include "efb_copy.h"
@@ -175,6 +176,88 @@ int main() {
         const std::vector<uint8_t> dummy64(8 * 8 * 4, 0);
         auto z4 = encode(params(cmd(kZ4), 8, 8, 0x100, true), dummy64, &z64);
         CHECK(z4[0] >> 4 == 1, "Z4 %02X", z4[0]);
+    }
+
+    // Vertical copy filter (BP 0x53 / 0x54). The taps of GXSetCopyFilter: without a filter it writes 0 0 21 22 21 0 0, the render
+    // modes with deflicker 8 8 10 12 10 8 8; 6-bit fields, c0..c3 in BP 0x53 and c4..c6 in BP 0x54.
+    {
+        const uint32_t id53 = (21u << 12) | (22u << 18), id54 = 21u;
+        const uint32_t df53 = 8u | (8u << 6) | (10u << 12) | (12u << 18), df54 = 10u | (8u << 6) | (8u << 12);
+        const CopyFilter id = make_copy_filter(id53, id54), df = make_copy_filter(df53, df54);
+        CHECK(id.identity() && id.above == 0 && id.centre == 64 && id.below == 0, "default taps %d %d %d", id.above, id.centre, id.below);
+        CHECK(df.above == 16 && df.centre == 32 && df.below == 16 && !df.identity(), "deflicker taps %d %d %d", df.above, df.centre, df.below);
+        CHECK(make_copy_filter(0, 0).identity(), "taps never written are not black");
+        const CopyFilter fade = make_copy_filter(32u << 12, 0);  // one tap of 32: half brightness
+        CHECK(fade.above == 0 && fade.centre == 32 && fade.below == 0, "fade taps");
+
+        // Three rows of one channel: 0, 255, 0 (RGBA, 2 pixels wide so the columns are shown to be independent).
+        auto rows = [](std::initializer_list<int> v) {
+            std::vector<uint8_t> img;
+            for (int r : v)
+                for (int x = 0; x < 2; ++x) img.insert(img.end(), {uint8_t(r), uint8_t(x ? 255 - r : r), uint8_t(r / 2), uint8_t(255)});
+            return img;
+        };
+        // Edge rows repeat when there is no neighbour: 16/32/16 of (0, 255, 0) gives 64, 128, 64 (rounded).
+        std::vector<uint8_t> img = rows({0, 255, 0});
+        apply_copy_filter(df, img.data(), 2, 3, nullptr, nullptr);
+        CHECK(img[0] == 64 && img[8] == 128 && img[16] == 64, "1-2-1 of a line: %u %u %u", img[0], img[8], img[16]);
+        CHECK(img[3] == 255 && img[11] == 255, "the filter weighs alpha like any channel (255 stays 255)");
+        CHECK(img[5] == 191 && img[13] == 128 && img[21] == 191, "second column reads its own data: %u %u %u", img[5], img[13], img[21]);
+        // With real neighbours above and below.
+        img = rows({0, 255, 0});
+        const std::vector<uint8_t> up = rows({255}), down = rows({255});
+        apply_copy_filter(df, img.data(), 2, 3, up.data(), down.data());
+        CHECK(img[0] == 128 && img[8] == 128 && img[16] == 128, "neighbours: %u %u %u", img[0], img[8], img[16]);
+        // The identity changes nothing; a single row and a zero-size copy are fine.
+        img = rows({10, 200, 30});
+        const std::vector<uint8_t> before = img;
+        apply_copy_filter(id, img.data(), 2, 3, up.data(), down.data());
+        CHECK(img == before, "identity");
+        std::vector<uint8_t> one = rows({100});
+        apply_copy_filter(df, one.data(), 2, 1, nullptr, nullptr);
+        CHECK(one[0] == 100, "one row repeated on both sides stays %u", one[0]);
+        apply_copy_filter(df, one.data(), 0, 0, nullptr, nullptr);
+        // Fading: weights summing to 32 halve the picture, to 0 black out.
+        img = rows({200, 200, 200});
+        apply_copy_filter(fade, img.data(), 2, 3, nullptr, nullptr);
+        CHECK(img[0] == 100 && img[8] == 100, "fade %u", img[0]);
+        // Taps summing past 64 clamp instead of wrapping.
+        img = rows({200, 200, 200});
+        apply_copy_filter(make_copy_filter(63u << 12 | 63u << 18, 0), img.data(), 2, 3, nullptr, nullptr);
+        CHECK(img[0] == 255, "clamped %u", img[0]);
+
+        // Which rows a filtered copy reads beyond its rectangle: the clamp bits and the EFB edges decide.
+        EfbCopyParams p = make_efb_copy_params(0, 0, 0, 0, 0, false);
+        int a, b;
+        p.y = 10; p.h = 100;
+        copy_filter_margins(p, 528, &a, &b);
+        CHECK(a == 1 && b == 1, "margins inside the EFB %d %d", a, b);
+        p = make_efb_copy_params(1u | 2u, 0, 0, 0, 0, false);  // clamp top and bottom
+        p.y = 10; p.h = 100;
+        copy_filter_margins(p, 528, &a, &b);
+        CHECK(a == 0 && b == 0 && p.clamp_top && p.clamp_bottom, "clamped margins %d %d", a, b);
+        p = make_efb_copy_params(0, 0, 0, 0, 0, false);
+        p.y = 0; p.h = 528;
+        copy_filter_margins(p, 528, &a, &b);
+        CHECK(a == 0 && b == 0, "margins at the EFB's edges %d %d", a, b);
+        p.y = 0; p.h = 100;
+        copy_filter_margins(p, 528, &a, &b);
+        CHECK(a == 0 && b == 1, "margins at the top edge %d %d", a, b);
+        // The command bits of a real copy: 0x010043 is the game's texture copy (clamp both, format 4).
+        p = make_efb_copy_params(0x010043, 0, 0, 0, 0, false);
+        CHECK(p.clamp_top && p.clamp_bottom && p.format == 4, "game copy command");
+
+        // A filtered texture copy end to end: the encoder gets the filtered rows.
+        std::vector<uint8_t> src(4 * 4 * 4, 0);
+        for (int y = 0; y < 4; ++y)
+            for (int x = 0; x < 4; ++x) src[(y * 4 + x) * 4 + 3] = 255;
+        for (int y = 2; y < 4; ++y)
+            for (int x = 0; x < 4; ++x) src[(y * 4 + x) * 4] = 255;  // red in the two lower rows
+        apply_copy_filter(df, src.data(), 4, 4, nullptr, nullptr);
+        const EfbCopyParams ep = params(cmd(6), 4, 4);
+        const std::vector<uint8_t> dec = gx::decode_texture(encode(ep, src).data(), 4, 4, gx::GX_TF_RGBA8);
+        CHECK(dec[(1 * 4) * 4] == 64 && dec[(2 * 4) * 4] == 191 && dec[0] == 0 && dec[(3 * 4) * 4] == 255, "edge softened in the copy: %u %u %u %u",
+              dec[0], dec[16], dec[32], dec[48]);
     }
 
     // Command decoding.

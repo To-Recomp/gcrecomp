@@ -20,6 +20,7 @@
 #include "gcrecomp/runtime.h"
 #include "gp_internal.h"
 #include "diag.h"
+#include "efb_copy.h"
 #include "gp_decode.h"
 #include "lighting.h"
 
@@ -519,9 +520,9 @@ private:
                 (value >> 16) & 1, ow, oh);
         const uint32_t f53 = s.bp[0x53], f54 = s.bp[0x54];
         const int c[7] = {int(f53 & 63), int((f53 >> 6) & 63), int((f53 >> 12) & 63), int((f53 >> 18) & 63), int(f54 & 63), int((f54 >> 6) & 63), int((f54 >> 12) & 63)};
-        const int top = c[0] + c[1], mid = c[2] + c[3] + c[4], bottom = c[5] + c[6];
-        appendf(t, "[COPY]   vertical filter bp53=%06X bp54=%06X taps %d %d %d %d %d %d %d: lines above/this/below = %d/%d/%d of 64 (%s; there is no enable bit, the SDK always writes the taps; 0 0 21 22 21 0 0 = unfiltered)\n",
-                f53, f54, c[0], c[1], c[2], c[3], c[4], c[5], c[6], top, mid, bottom, (top == 0 && mid == 64 && bottom == 0) ? "identity" : "ACTIVE");
+        const CopyFilter flt = make_copy_filter(f53, f54);
+        appendf(t, "[COPY]   vertical filter bp53=%06X bp54=%06X taps %d %d %d %d %d %d %d: lines above/this/below = %d/%d/%d of 64 (%s; there is no enable bit, the SDK always writes the taps; 0 0 21 22 21 0 0 = unfiltered, all zero = never written = unfiltered)\n",
+                f53, f54, c[0], c[1], c[2], c[3], c[4], c[5], c[6], flt.above, flt.centre, flt.below, flt.identity() ? "identity" : "ACTIVE");
         appendf(t, "[COPY]   bp47/48 token=%06X sample pattern bp01..04=%06X %06X %06X %06X genmode=%06X (msaa %u)\n", s.bp[0x48], s.bp[1], s.bp[2], s.bp[3], s.bp[4], s.bp[0],
                 (s.bp[0] >> 9) & 1);
         return t;

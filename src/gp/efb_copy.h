@@ -40,12 +40,41 @@ struct EfbCopyParams {
     uint32_t y_scale_reg = 0;  // BP 0x4E, 256 / vertical scale
     bool depth = false;        // copy Z instead of color
     uint32_t stride = 0;       // destination bytes per row of tiles (BP 0x4D * 32)
+    bool clamp_top = false;    // command bit 0: the filter repeats the first row instead of reading the EFB above the rectangle
+    bool clamp_bottom = false; // command bit 1: likewise below the last row
 };
 
 // Decode the copy command (BP 0x52), the source rectangle registers, the stride register and the
 // Y scale register. `depth` is true when the EFB is in Z24 mode (BP 0x43).
 EfbCopyParams make_efb_copy_params(uint32_t copy_cmd, uint32_t src_xy, uint32_t src_wh, uint32_t stride_reg,
                                    uint32_t y_scale_reg, bool depth);
+
+// ---- Vertical copy filter -----------------------------------------------------------------------
+//
+// BP 0x53 holds the taps c0..c3 and BP 0x54 c4..c6 (6 bits each, from bit 0; GXSetCopyFilter writes both for every copy,
+// whatever the `vf` argument: without a filter it writes 0 0 21 22 21 0 0, the SDK's render modes with deflicker write
+// 8 8 10 12 10 8 8; there is no enable bit). The hardware filters while it reads the EFB: the 7 taps are weights, in 64ths, of
+// the sample rows of a three-line window, two for the line above (c0, c1), three for the line itself (c2, c3, c4) and
+// two for the line below (c5, c6), which is the layout of the 12-sample anti-aliasing pattern. Without anti-aliasing
+// (one sample per pixel, what the renderer has) the weights of a line are added: 0 0 21 22 21 0 0 is 0/64, 64/64, 0/64
+// (unfiltered), 8 8 10 12 10 8 8 is 16/64, 32/64, 16/64 (the 1-2-1 deflicker blur), and taps that sum to less than 64
+// darken the copy (some games fade the screen out with them). A copy filters colour; depth copies are not filtered.
+// All taps zero (a game that never wrote them) is treated as unfiltered, not as black.
+
+struct CopyFilter {
+    int above = 0, centre = 64, below = 0;  // weights of the line above, the line itself and the line below, in 64ths
+    bool identity() const { return above == 0 && centre == 64 && below == 0; }
+};
+
+CopyFilter make_copy_filter(uint32_t bp53, uint32_t bp54);
+
+// How many rows of the EFB the filter reads above (`above`) and below (`below`) the copy rectangle: 1 each, except where
+// the clamp bit makes the edge row repeat or the rectangle touches the EFB's edge (`efb_height` rows).
+void copy_filter_margins(const EfbCopyParams& p, int efb_height, int* above, int* below);
+
+// Filters `h` rows of `w` RGBA pixels in place. `above` / `below` are the neighbour rows (w*4 bytes) or null to repeat the first /
+// last row. out = (above*U + centre*C + below*D + 32) / 64 per channel, clamped to 255.
+void apply_copy_filter(const CopyFilter& f, uint8_t* rgba, int w, int h, const uint8_t* above, const uint8_t* below);
 
 // Size in pixels of the destination image.
 void efb_copy_output_size(const EfbCopyParams& p, int* out_w, int* out_h);
