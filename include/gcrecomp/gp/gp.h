@@ -67,12 +67,23 @@ struct RenderStats {
     uint64_t efb_gpu_hits = 0;         // texture uses served by such a copy instead of decoding guest memory
     uint64_t efb_guard_hits = 0;       // CPU reads that found a copy not written yet and made the GP module write it
     uint64_t gl_draws = 0;             // glDrawElements calls (a batch of the draws above is one)
+    uint64_t batches = 0;              // batches drawn (one glDrawElements, two with the depth replay)
+    uint64_t draws_batched = 0;        // draws collected into batches
+    uint64_t draws_direct = 0;         // draws made at once: lines, points, or batching off
+    uint64_t draws_replayed = 0;       // draws that were drawn a second time, depth only (no early fragment tests)
+    uint64_t draws_early_program = 0;  // draws that needed the early-Z depth write and got it from the early-fragment-test program
+    uint64_t flush_why[7] = {};        // batches drawn because: the register state changed, a texture binding/contents/sampler changed, the
+                                       // program changed, the batch was full, pixels overlapped (replay fallback), a direct draw came, other (EFB copy)
+    uint64_t ez_late = 0, ez_no_depth_test = 0, ez_no_depth_write = 0, ez_alpha_never_rejects = 0;  // draws that need no early-Z depth write, by the first reason
     uint64_t draws_same_state = 0;     // draws whose GL register state equals the previous draw's (candidates for merging)
     uint64_t efb_flushes = 0;          // GPU copies whose bytes were written to guest memory
     // Wall nanoseconds spent in the renderer, measured only while GCRECOMP_BENCH is set (docs/BENCHMARK.md).
     uint64_t parse_ns = 0;             // Parser::draw: vertex decode, transform, lighting, then renderer::draw
     uint64_t draw_ns = 0;              // renderer::draw: state, vertex upload, glDrawArrays
     uint64_t readback_ns = 0;          // glReadPixels of EFB-to-memory copies (the wait for the GPU)
+    uint64_t apply_ns = 0;             // the part of renderer::draw that translates state and validates textures (apply_state)
+    uint64_t add_ns = 0;               // collecting a draw into the batch
+    uint64_t flush_ns = 0;             // drawing a batch (vertex upload, glDrawElements)
     uint64_t swap_ns = 0;              // blit and buffer swap of a presented frame
 };
 const RenderStats& render_stats();

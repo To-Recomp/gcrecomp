@@ -29,6 +29,8 @@ typedef struct __GLsync* GLsync;
 typedef std::uint64_t GLuint64;
 
 #define GL_ALWAYS 0x0207
+#define GL_EXTENSIONS 0x1F03
+#define GL_NUM_EXTENSIONS 0x821D
 #define GL_ELEMENT_ARRAY_BUFFER 0x8893
 #define GL_ALREADY_SIGNALED 0x911A
 #define GL_CONDITION_SATISFIED 0x911C
@@ -177,6 +179,8 @@ typedef std::uint64_t GLuint64;
     X(void, glGetShaderInfoLog, (GLuint shader, GLsizei bufSize, GLsizei *length, GLchar *infoLog)) \
     X(void, glGetShaderiv, (GLuint shader, GLenum pname, GLint *params)) \
     X(const GLubyte *, glGetString, (GLenum name)) \
+    X(const GLubyte *, glGetStringi, (GLenum name, GLuint index)) \
+    X(void, glGetIntegerv, (GLenum pname, GLint *data)) \
     X(GLint, glGetUniformLocation, (GLuint program, const GLchar *name)) \
     X(void, glLinkProgram, (GLuint program)) \
     X(void, glLogicOp, (GLenum opcode)) \

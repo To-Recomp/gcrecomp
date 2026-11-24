@@ -400,11 +400,13 @@ GLuint g_bound[8] = {~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
 int g_active_unit = -1;
 
 // Binds `id` to `unit` for sampling; the active unit is left alone when the texture is already bound there.
-void flush_batch();  // draws the batched triangles (see "Draw batching" below); before any change of GL state they depend on
+// Why a batch was drawn (RenderStats::flush_why).
+enum FlushWhy { kWhyState, kWhyTexture, kWhyProgram, kWhySize, kWhyOverlap, kWhyDirect, kWhyOther };
+void flush_batch(int why = kWhyOther);  // draws the batched triangles (see "Draw batching" below); before any change of GL state they depend on
 
 void bind_unit_texture(int unit, GLuint id) {
     if (g_bound[unit] == id) return;
-    flush_batch();
+    flush_batch(kWhyTexture);
     if (g_active_unit != unit) {
         glActiveTexture(GL_TEXTURE0 + unit);
         g_active_unit = unit;
@@ -420,7 +422,7 @@ void edit_unit_texture(int unit, GLuint id) {
         g_active_unit = unit;
     }
     if (g_bound[unit] != id) {
-        flush_batch();
+        flush_batch(kWhyTexture);
         glBindTexture(GL_TEXTURE_2D, id);
         g_bound[unit] = id;
     }
@@ -583,7 +585,7 @@ SamplerParams wanted_sampler(uint32_t mode0, uint32_t mode1, uint32_t levels) {
 
 void apply_sampler(int map, GLuint id, SamplerParams& cache, bool& valid, const SamplerParams& want) {
     if (valid && cache == want) return;
-    flush_batch();
+    flush_batch(kWhyTexture);
     edit_unit_texture(map, id);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, want.wrap_s);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, want.wrap_t);
@@ -670,7 +672,7 @@ GLuint texture_for_map(const State& s, int map) {
         if (trace_tex)
             std::fprintf(stderr, "[TEX] frame %llu decode map=%d addr=%06X fmt=%X %ux%u levels=%u %s data=%08X palette=%08X\n", (unsigned long long)g_frames, map, addr, fmt, w, h,
                          levels, t.id == 0 ? "new" : t.decoded_data != t.data_hash ? "data changed" : "palette changed", unsigned(t.data_hash), unsigned(t.tlut_hash));
-        flush_batch();  // queued draws sample the old contents
+        flush_batch(kWhyTexture);  // queued draws sample the old contents
         t.decoded_data = t.data_hash;
         t.decoded_tlut = t.tlut_hash;
         const std::vector<uint8_t> rgba = decode_level(0);
@@ -825,7 +827,7 @@ void apply_register_state(const State& s) {
         const bool early = g_program_early && early_z_writes_rejected_pixels(s.bp);
         const GLuint want = early ? g_program_early : g_program;
         if (want != g_active) {
-            flush_batch();  // queued draws belong to the other program
+            flush_batch(kWhyProgram);  // queued draws belong to the other program
             g_active = want;
             glUseProgram(want);
             g_loc = g_locs[early ? 1 : 0];
@@ -1214,7 +1216,9 @@ bool init(int window_w, int window_h, const char* screenshot_dir, int max_screen
     locate(g_program, g_locs[0]);
     // The early-fragment-test variant. GP_EARLY_TESTS=0 leaves it out (the depth replay is used then).
     const char* early_env = std::getenv("GP_EARLY_TESTS");
+    const char* early_state = "disabled by GP_EARLY_TESTS=0";
     if (!early_env || std::atoi(early_env) != 0) {
+        early_state = "not available (the program did not build)";
         std::string src = kFragmentShader;
         const size_t eol = src.find('\n');
         src.insert(eol + 1, "#extension GL_ARB_shader_image_load_store : require\nlayout(early_fragment_tests) in;\n");
@@ -1231,6 +1235,7 @@ bool init(int window_w, int window_h, const char* screenshot_dir, int max_screen
         if (ok) {
             g_program_early = prog;
             locate(prog, g_locs[1]);
+            early_state = "active";
         } else {
             std::fprintf(stderr, "[GL] early fragment tests are not available: alpha-tested draws that write depth are drawn twice\n");
         }
@@ -1238,6 +1243,18 @@ bool init(int window_w, int window_h, const char* screenshot_dir, int max_screen
     g_active = g_program;
     g_loc = g_locs[0];
     glUseProgram(g_active);
+    {
+        bool ext = false;
+        GLint n = 0;
+        glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+        for (GLint i = 0; i < n && !ext; ++i) {
+            const char* e = reinterpret_cast<const char*>(glGetStringi(GL_EXTENSIONS, GLuint(i)));
+            ext = e && !std::strcmp(e, "GL_ARB_shader_image_load_store");
+        }
+        const char* merge_env = std::getenv("GP_DRAW_MERGE");
+        std::fprintf(stderr, "[GL] draw batching %s; early fragment tests %s (GL_ARB_shader_image_load_store %s)\n",
+                     !merge_env || std::atoi(merge_env) != 0 ? "on" : "off (GP_DRAW_MERGE=0)", early_state, ext ? "listed" : "not listed");
+    }
 
     // The pass that presents an EFB copy through the vertical filter (a plain blit when the filter is the identity).
     {
@@ -1344,6 +1361,7 @@ namespace {
 // two triangles (0 1 2) (0 2 3). Nothing here reorders anything: the triangles are drawn in the order they came.
 struct Batch {
     bool open = false;
+    uint32_t ndraws = 0;   // draws collected
     bool early_z = false;  // each draw needs the depth replay (below): the group must be pixel-disjoint
     uint32_t gen = 0;
     std::vector<std::array<float, 4>> boxes;  // clip-space boxes of the draws of an early-Z group
@@ -1353,13 +1371,17 @@ struct Batch {
 size_t g_ring_used = 0;
 bool g_in_draw = false;
 
-void flush_batch() {
+void flush_batch(int why) {
     if (!g_batch.open) return;
     g_batch.open = false;
     if (g_batch.idx.empty()) {
         g_batch.verts.clear();
+        g_batch.ndraws = 0;
         return;
     }
+    bench::ScopedNs flush_timer(g_render_stats.flush_ns);
+    ++g_render_stats.batches;
+    ++g_render_stats.flush_why[why];
     static uint64_t nested_ns = 0;  // renderer::draw's own timer already counts a flush it makes
     bench::ScopedNs timer(g_in_draw ? nested_ns : g_render_stats.draw_ns);
     constexpr size_t kVertexBytes = kVertexFloats * sizeof(float);
@@ -1396,6 +1418,7 @@ void flush_batch() {
         // rejected ones write it now. The draws of the group touch no common pixel (batch_add), so replaying them together
         // is replaying each after its own draw. The colour mask and the alpha test uniform are put back.
         ++g_use.early_z_passes;
+        g_render_stats.draws_replayed += g_batch.ndraws;
         const int mask = g_sh.color_mask;
         const uint32_t cmp0 = g_sh.alpha_cmp.w[0], cmp1 = g_sh.alpha_cmp.w[1];
         glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
@@ -1409,12 +1432,15 @@ void flush_batch() {
     g_batch.verts.clear();
     g_batch.idx.clear();
     g_batch.boxes.clear();
+    g_batch.ndraws = 0;
 }
 
 void batch_add(const DrawCall& call, const State& s) {
+    bench::ScopedNs add_timer(g_render_stats.add_ns);
+    ++g_render_stats.draws_batched;
     std::vector<float>& verts = g_batch.verts;
     std::vector<uint32_t>& idx = g_batch.idx;
-    if (g_batch.open && (verts.size() * sizeof(float) > (8u << 20) || (g_batch.early_z && g_batch.boxes.size() >= 64))) flush_batch();
+    if (g_batch.open && (verts.size() * sizeof(float) > (8u << 20) || (g_batch.early_z && g_batch.boxes.size() >= 64))) flush_batch(kWhySize);
     const bool early_z = needs_replay(s);
     if (early_z) {
         // The box of the draw in clip space (a vertex at or behind the eye plane: the whole screen), a little widened.
@@ -1433,7 +1459,7 @@ void batch_add(const DrawCall& call, const State& s) {
         if (g_batch.open)
             for (const auto& b : g_batch.boxes)
                 if (!(x1 < b[0] || x0 > b[2] || y1 < b[1] || y0 > b[3])) {
-                    flush_batch();  // pixels in common: the replay of the first must come before the second's draw
+                    flush_batch(kWhyOverlap);  // pixels in common: the replay of the first must come before the second's draw
                     break;
                 }
         if (!g_batch.open) {
@@ -1447,6 +1473,7 @@ void batch_add(const DrawCall& call, const State& s) {
         g_batch.gen = s.gen;
     }
     g_batch.early_z = early_z;
+    ++g_batch.ndraws;
     const uint32_t base = uint32_t(verts.size() / kVertexFloats), n = call.vertex_count;
     verts.insert(verts.end(), call.vertices, call.vertices + size_t(n) * kVertexFloats);
     switch (call.primitive) {
@@ -1569,6 +1596,7 @@ static void draw_direct(const DrawCall& call, const State& s) {
         // and fail the depth test against themselves, the rejected ones write it now. apply_state
         // restores the color mask and the alpha test uniform for the next draw.
         ++g_use.early_z_passes;
+        ++g_render_stats.draws_replayed;
         // The state this draw ran with, put back after the replay (a full translation of the state for every such draw was 3% of a boss frame).
         const int mask = g_sh.color_mask;
         const uint32_t cmp0 = g_sh.alpha_cmp.w[0], cmp1 = g_sh.alpha_cmp.w[1];
@@ -1637,8 +1665,17 @@ void draw(const DrawCall& call, const State& s) {
         if (s.gen == last_gen) ++g_render_stats.draws_same_state;
         last_gen = s.gen;
     }
-    if (g_batch.open && g_batch.gen != s.gen) flush_batch();  // the state changes below
-    apply_state(s);
+    if (g_batch.open && g_batch.gen != s.gen) flush_batch(kWhyState);  // the state changes below
+    {
+        bench::ScopedNs apply_timer(g_render_stats.apply_ns);
+        apply_state(s);
+    }
+    // Why this draw does, or does not, need the depth write of alpha-rejected pixels (the first reason that applies).
+    if (!((s.bp[0x43] >> 6) & 1)) ++g_render_stats.ez_late;
+    else if (!(s.bp[0x40] & 1)) ++g_render_stats.ez_no_depth_test;
+    else if (!((s.bp[0x40] >> 4) & 1)) ++g_render_stats.ez_no_depth_write;
+    else if (!alpha_test_can_reject(s.bp[0xF3])) ++g_render_stats.ez_alpha_never_rejects;
+    else if (g_program_early) ++g_render_stats.draws_early_program;
 
     // Triangles, quads, strips and fans of one state are collected and drawn as one indexed triangle list.
     static const bool merge = std::getenv("GP_DRAW_MERGE") == nullptr || std::atoi(std::getenv("GP_DRAW_MERGE")) != 0;
@@ -1648,7 +1685,8 @@ void draw(const DrawCall& call, const State& s) {
         batch_add(call, s);
         return;
     }
-    flush_batch();
+    flush_batch(kWhyDirect);
+    ++g_render_stats.draws_direct;
     draw_direct(call, s);
 }
 

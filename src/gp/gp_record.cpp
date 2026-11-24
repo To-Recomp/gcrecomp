@@ -180,10 +180,20 @@ bool replay(const char* path, int loops) {
         const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         const RenderStats after = render_stats();
         const double fr = frames ? frames : 1;
-        std::printf("loop %d: %d frames, %.2f ms/frame, %.0f draws/frame, parse %.2f ms/frame (renderer %.2f, read-back wait %.2f), %.0f vertices/frame, %.0f draws/frame with the state of the previous one, %.0f GL draw calls/frame\n", loop + 1,
+        std::printf("loop %d: %d frames, %.2f ms/frame, %.0f draws/frame, parse %.2f ms/frame (renderer %.2f: apply %.2f, collect %.2f, draw %.2f; read-back wait %.2f), %.0f vertices/frame\n", loop + 1,
                     frames, wall * 1e3 / fr, double(stats().draws) / fr, double(after.parse_ns - before.parse_ns) * 1e-6 / fr,
-                    double(after.draw_ns - before.draw_ns) * 1e-6 / fr, double(after.readback_ns - before.readback_ns) * 1e-6 / fr,
-                    double(stats().vertices) / fr, double(after.draws_same_state - before.draws_same_state) / fr, double(after.gl_draws - before.gl_draws) / fr);
+                    double(after.draw_ns - before.draw_ns) * 1e-6 / fr, double(after.apply_ns - before.apply_ns) * 1e-6 / fr,
+                    double(after.add_ns - before.add_ns) * 1e-6 / fr, double(after.flush_ns - before.flush_ns) * 1e-6 / fr,
+                    double(after.readback_ns - before.readback_ns) * 1e-6 / fr, double(stats().vertices) / fr);
+        auto per = [&](uint64_t RenderStats::*m) { return double(after.*m - before.*m) / fr; };
+        std::printf("        per frame: %.0f GL draw calls, %.0f batches (%.0f draws batched, %.0f direct, %.0f replayed, %.0f on the early-fragment-test program); batches ended by state %.0f, texture %.0f, program %.0f, size %.0f, overlap %.0f, direct draw %.0f, other %.0f\n",
+                    per(&RenderStats::gl_draws), per(&RenderStats::batches), per(&RenderStats::draws_batched), per(&RenderStats::draws_direct),
+                    per(&RenderStats::draws_replayed), per(&RenderStats::draws_early_program), double(after.flush_why[0] - before.flush_why[0]) / fr,
+                    double(after.flush_why[1] - before.flush_why[1]) / fr, double(after.flush_why[2] - before.flush_why[2]) / fr,
+                    double(after.flush_why[3] - before.flush_why[3]) / fr, double(after.flush_why[4] - before.flush_why[4]) / fr,
+                    double(after.flush_why[5] - before.flush_why[5]) / fr, double(after.flush_why[6] - before.flush_why[6]) / fr);
+        std::printf("        draws without the early-Z depth write: late Z %.0f, no depth test %.0f, no depth write %.0f, alpha test never rejects %.0f\n",
+                    per(&RenderStats::ez_late), per(&RenderStats::ez_no_depth_test), per(&RenderStats::ez_no_depth_write), per(&RenderStats::ez_alpha_never_rejects));
         std::fflush(stdout);
     }
     return true;
