@@ -22,6 +22,7 @@
 #include "diag.h"
 #include "efb_copy.h"
 #include "gp_decode.h"
+#include "gp_record.h"
 #include "lighting.h"
 
 namespace gcrecomp::gp {
@@ -248,6 +249,7 @@ void unpack_rgba8(uint32_t packed, float out[4]) {
 
 class Parser {
 public:
+    bool idle() const { return buf_.empty(); }
     void feed(const uint8_t* data, size_t n) {
         buf_.insert(buf_.end(), data, data + n);
         for (size_t i = 0; i < n; ++i) raw_[raw_pos_++ & 255] = data[i];
@@ -559,7 +561,10 @@ private:
         }
         if (g_graphics) renderer::copy_efb(r, g_state);
         if (r.diag && edge == diag::Trigger::Edge::Finish) diag::finish(g_frames);
-        if (r.to_xfb) ++g_frames;
+        if (r.to_xfb) {
+            ++g_frames;
+            record::on_frame_end();
+        }
     }
 
     // The register state a draw runs with, one [STATE] line per unit: what GP_TRACE_STATE prints and a diagnostic bundle
@@ -953,7 +958,11 @@ void reset() {
     g_parser = Parser{};
 }
 
-void feed(const uint8_t* data, size_t n) { g_parser.feed(data, n); }
+void feed(const uint8_t* data, size_t n) {
+    record::on_feed(data, n);
+    g_parser.feed(data, n);
+    record::on_feed_done(g_parser.idle());
+}
 
 // Where a write-gather store goes depends on the FIFO registers. The CPU FIFO (PI registers at
 // 0xCC00300C base, 0xCC003010 end, 0xCC003014 write pointer) is where the hardware stores the
