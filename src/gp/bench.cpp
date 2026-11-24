@@ -119,6 +119,8 @@ void report(const Sample& a, const Sample& b) {
     std::fprintf(stderr,
                  "[bench] t=%.1f fps=%.2f retrace=%.2f presented=%llu retraces=%llu dispatch=%s/s memops=%s/s draws=%llu verts=%llu "
                  "texdec=%llu texdec_indexed=%llu textexels=%llu texhash=%llu texhash_bytes=%s efbmem=%llu efbmem_px=%s efbgpu=%llu efbgpu_hits=%llu efbflush=%llu efbguard=%llu "
+                 "gldraws=%llu batches=%llu batched=%llu direct=%llu replayed=%llu earlyprog=%llu flush_state=%llu flush_tex=%llu flush_prog=%llu flush_size=%llu flush_overlap=%llu flush_direct=%llu flush_other=%llu "
+                 "ez_late=%llu ez_notest=%llu ez_nowrite=%llu ez_noreject=%llu apply_ms=%.0f add_ms=%.0f flush_ms=%.0f "
                  "parse_ms=%.0f draw_ms=%.0f readback_ms=%.0f swap_ms=%.0f cpu=%.0f%% idle=%.0f%% threads=%s\n",
                  b.t, double(b.presented - a.presented) / dt, double(b.retraces - a.retraces) / dt, (unsigned long long)b.presented,
                  (unsigned long long)b.retraces, human(double(b.dispatch - a.dispatch) / dt).c_str(),
@@ -132,6 +134,18 @@ void report(const Sample& a, const Sample& b) {
                  human(double(b.render.efb_copy_pixels - a.render.efb_copy_pixels)).c_str(),
                  (unsigned long long)(b.render.efb_gpu_copies - a.render.efb_gpu_copies), (unsigned long long)(b.render.efb_gpu_hits - a.render.efb_gpu_hits),
                  (unsigned long long)(b.render.efb_flushes - a.render.efb_flushes), (unsigned long long)(b.render.efb_guard_hits - a.render.efb_guard_hits),
+                 (unsigned long long)(b.render.gl_draws - a.render.gl_draws), (unsigned long long)(b.render.batches - a.render.batches),
+                 (unsigned long long)(b.render.draws_batched - a.render.draws_batched), (unsigned long long)(b.render.draws_direct - a.render.draws_direct),
+                 (unsigned long long)(b.render.draws_replayed - a.render.draws_replayed), (unsigned long long)(b.render.draws_early_program - a.render.draws_early_program),
+                 (unsigned long long)(b.render.flush_why[0] - a.render.flush_why[0]), (unsigned long long)(b.render.flush_why[1] - a.render.flush_why[1]),
+                 (unsigned long long)(b.render.flush_why[2] - a.render.flush_why[2]), (unsigned long long)(b.render.flush_why[3] - a.render.flush_why[3]),
+                 (unsigned long long)(b.render.flush_why[4] - a.render.flush_why[4]), (unsigned long long)(b.render.flush_why[5] - a.render.flush_why[5]),
+                 (unsigned long long)(b.render.flush_why[6] - a.render.flush_why[6]),
+                 (unsigned long long)(b.render.ez_late - a.render.ez_late), (unsigned long long)(b.render.ez_no_depth_test - a.render.ez_no_depth_test),
+                 (unsigned long long)(b.render.ez_no_depth_write - a.render.ez_no_depth_write),
+                 (unsigned long long)(b.render.ez_alpha_never_rejects - a.render.ez_alpha_never_rejects),
+                 double(b.render.apply_ns - a.render.apply_ns) * 1e-6 / dt, double(b.render.add_ns - a.render.add_ns) * 1e-6 / dt,
+                 double(b.render.flush_ns - a.render.flush_ns) * 1e-6 / dt,
                  double(b.render.parse_ns - a.render.parse_ns) * 1e-6 / dt, double(b.render.draw_ns - a.render.draw_ns) * 1e-6 / dt,
                  double(b.render.readback_ns - a.render.readback_ns) * 1e-6 / dt, double(b.render.swap_ns - a.render.swap_ns) * 1e-6 / dt,
                  100.0 * cpu_total / dt,
