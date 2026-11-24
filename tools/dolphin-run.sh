@@ -16,9 +16,13 @@
 #   --dump-frames is also given. Runs in the background without disturbing the desktop.
 # --iso takes an image; tools/gcm-from-dir.py rebuilds one from an extracted disc directory (Dolphin's folder boot does not
 #   accept the extractor's layout).
+# --play: play by hand instead of by script: no steps, the window stays open until you close it (or Ctrl-C). Your own
+#   controller/keyboard mapping is copied from --pad-ini FILE (default ~/.config/dolphin-emu/GCPadNew.ini if it exists)
+#   into the isolated user dir, so the real configuration is never touched. Combine with --card (a COPY of a card image),
+#   --dump-frames and --dump-audio to keep what was on screen for comparison with the recomp.
 # Needs dolphin-emu, spectacle (KDE) and ImageMagick for the screenshots. Linux only.
 set -euo pipefail
-iso=""; card=""; gci=""; user="/tmp/dolphin-run-user"; dump_audio=0; dump_frames=0; mute=0; headless=0; backend=""
+iso=""; card=""; gci=""; user="/tmp/dolphin-run-user"; dump_audio=0; dump_frames=0; mute=0; headless=0; backend=""; play=0; padini=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --iso) iso="$2"; shift 2 ;;
@@ -29,6 +33,8 @@ while [ $# -gt 0 ]; do
     --dump-frames) dump_frames=1; shift ;;
     --no-audio) mute=1; shift ;;
     --headless) headless=1; shift ;;
+    --play) play=1; shift ;;
+    --pad-ini) padini="$2"; shift 2 ;;
     --backend) backend="$2"; shift 2 ;;
     --) shift; break ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
@@ -62,6 +68,10 @@ EOF
 if [ "$dump_frames" = 1 ]; then
   printf '[Movie]\nDumpFrames = True\nDumpFramesSilent = True\n' >> "$user/Config/Dolphin.ini"
 fi
+if [ "$play" = 1 ]; then
+  [ -n "$padini" ] || padini="$HOME/.config/dolphin-emu/GCPadNew.ini"
+  if [ -f "$padini" ]; then cp "$padini" "$user/Config/GCPadNew.ini"; else echo "[dolphin-run] no pad config ($padini): Dolphin's defaults apply" >&2; fi
+else
 cat > "$user/Config/GCPadNew.ini" <<'EOF'
 [GCPad1]
 Device = Pipe/0/pad
@@ -83,6 +93,7 @@ Main Stick/Left = `Axis X -`
 Main Stick/Right = `Axis X +`
 EOF
 mkfifo "$user/Pipes/pad"
+fi
 
 # headless: dump the frames (shots copy the newest one)
 if [ "$headless" = 1 ] && [ "$dump_frames" = 0 ]; then
@@ -103,6 +114,11 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+if [ "$play" = 1 ]; then
+  echo "[dolphin-run] Dolphin is running (user dir $user); close its window to stop."
+  wait "$dolphin" || true
+  exit 0
+fi
 exec 3<>"$user/Pipes/pad"
 for step in "$@"; do
   case "$step" in
