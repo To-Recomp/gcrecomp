@@ -22,6 +22,26 @@ Switches and tools for finding out why a frame looks wrong. Nothing here needs a
 | `GP_TRACE_TEX=1` | Logs every texture decode (`[TEX] frame N decode map=M addr=ADDR fmt=F WxH levels=L REASON data=H palette=P`): the reason is `new`, `data changed` (the game rewrote the texture or an EFB copy landed in it) or `palette changed` (a palette format whose TLUT was loaded with other contents), with the hashes. A texture decoded every frame shows here; `GCRECOMP_BENCH` counts them (`texdec=`). |
 | `GP_SKIP_DRAW=1` | The draws are parsed and decoded but not given to GL: isolates the cost of the renderer and the GPU (a game that adapts its frame rate to the host runs faster; see docs/BENCHMARK.md, the first temple boss). The picture stays empty. |
 | `GP_APPLY_ALWAYS=1` | The renderer translates the BP/XF register state to GL for every draw instead of only after a register changed (`State::gen`): for comparing pictures with and without the skip. |
+| `GCRECOMP_DIAG_DIR=dir` | Where diagnostic bundles (below) are written; without it the screenshot directory of the host program (`TOS_SCREENSHOT_DIR`), without that the current directory. |
+
+## The diagnostic bundle (F10)
+
+Press **F10** in the game window (or run the script command `diag NAME`, docs/INPUT_SCRIPT.md) when the picture shows
+what you want to look at: the renderer records the **next presented frame** completely and writes, as soon as that frame is
+presented, a directory `diag-<n>-<UTC timestamp>[-NAME]/` under `GCRECOMP_DIAG_DIR` / `TOS_SCREENSHOT_DIR`:
+
+| File | Content |
+| --- | --- |
+| `diag.txt` | Every draw of the frame in order (`[DRAW] #N` line as `GP_TRACE_FRAME` prints it: primitive, vertex count, VCD, TEV stage 0, Z mode, blend, alpha compare, texture 0, projection, viewport; the first vertices in clip space; every vertex of draws of 8 vertices or fewer as `[VERT]`: position, device coordinates, colour, texture coordinates, which is where the quads of screen-space passes and overlays are) and, after it, the full state the draw ran with (`[STATE]`, as `GP_TRACE_STATE` prints it, extended: Z / blend / alpha-test decoded, viewport, scissor and projection, every TEV stage decoded, texgens, every texture map used with size, format, address, wrap, min / mag filter, LOD bias, fog, fog range adjust, indirect stages); a draw whose state equals the previous draw's only says so. Every EFB copy in its place as `[COPY]` lines: source rectangle, destination address and format, stride, scale (BP 0x4E), clear and the clear colours, the pixel format, clamp, gamma, half scale / mipmap generation, and the vertical copy filter registers (BP 0x53 / 0x54: the seven taps and the weights they give the line above / this line / the line below; the filter has no enable bit, the SDK writes the taps for every copy and `0 0 21 22 21 0 0` is the unfiltered pattern). The XFB copy is last. |
+| `summary.txt` | The frame number, counts per kind (draws, per primitive, vertices, EFB copies to textures and to the XFB), and the features the frame used with `implemented` / `NOT IMPLEMENTED`: indirect texturing, fog range adjust, Z texture, the EFB copy vertical filter, copy gamma, YUV and frame-to-field, and the ones that are implemented (TEV compare modes, constant destination alpha, blend logic ops, early Z with alpha test, projective texgens, LOD bias, mipmap filters, half scale, Y scale, depth copies). |
+| `window.ppm` | The window as presented (what `shot` writes). |
+| `efb-copyNN-destADDR-fmtF.ppm`, `efb-xfb.ppm` | The EFB over the source rectangle of each EFB-to-texture copy of the frame (at most 8) and of the XFB copy, taken just before the copy runs; `.alpha.pgm` next to each is the alpha channel. A blur or glow built from copies shows up as the stages: the scene in the EFB, then the copy, then what is drawn over it. |
+
+The key is read once per frame: the frame in progress is already partly drawn, so the bundle starts at the next XFB copy and
+covers the frame after it. The game is never stalled for more than that one frame (the EFB read-backs), and with nothing
+requested the cost is one atomic load per draw and per copy. A second request while one is pending is ignored (`[diag]` lines
+on stderr say what happened and where the files went). F10 cannot be bound to a pad control in the keyboard map. Bundles
+contain pictures of the game: never commit them.
 
 ## Environment variables (guest memory and calls)
 

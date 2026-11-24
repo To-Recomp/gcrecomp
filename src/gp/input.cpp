@@ -2,6 +2,7 @@
 #include "input.h"
 
 #include "gcrecomp/gp/gp.h"
+#include "diag.h"
 
 #include <SDL3/SDL.h>
 
@@ -221,6 +222,7 @@ bool parse_keymap(const std::string& toml, KeyMap& map, std::string& error) {
         for (const std::string& name : names) {
             const SDL_Scancode sc = SDL_GetScancodeFromName(name.c_str());
             if (sc == SDL_SCANCODE_UNKNOWN) return fail("unknown key name \"" + name + "\"");
+            if (is_reserved_key(int(sc))) return fail("\"" + name + "\" is reserved for the diagnostic hotkey");
             codes.push_back(int(sc));
         }
         result.keys[control] = std::move(codes);
@@ -259,6 +261,8 @@ PadState keyboard_to_pad(const KeyMap& map, const bool* keys, int count) {
     p.trigger_r = (b & kR) ? 255 : 0;
     return p;
 }
+
+bool is_reserved_key(int scancode) { return scancode == SDL_SCANCODE_F10; }
 
 bool is_neutral(const PadState& p) {
     return p.buttons == 0 && p.stick_x == 0 && p.stick_y == 0 && p.substick_x == 0 && p.substick_y == 0 &&
@@ -368,6 +372,12 @@ void load_script() {
     else std::fprintf(stderr, "[script] %zu command(s) loaded\n", g_script.commands().size());
 }
 
+// F10 or the script command `diag NAME`: record the next presented frame (diag.h).
+void request_diag(const char* name) {
+    if (diag::g_trigger.request(name)) std::fprintf(stderr, "[diag] requested: the next presented frame will be recorded\n");
+    else std::fprintf(stderr, "[diag] a bundle is already being recorded\n");
+}
+
 uint16_t run_script() {
     if (g_script.empty()) return 0;
     Observation o;
@@ -380,6 +390,7 @@ uint16_t run_script() {
     for (const std::string& f : o.files) std::fprintf(stderr, "[script] frame %d: game opened %s\n", g_frame, f.c_str());
     const uint16_t buttons = g_script.step(o);
     for (int n : g_script.take_traces()) request_trace_frame(uint64_t(n));
+    for (const std::string& name : g_script.take_diags()) request_diag(name.c_str());
     for (const std::string& line : g_script.take_log()) std::fprintf(stderr, "[script] %s\n", line.c_str());
     return buttons;
 }
@@ -418,7 +429,9 @@ void shutdown() {
 }
 
 void handle_event(const SDL_Event& e) {
-    if (e.type == SDL_EVENT_GAMEPAD_ADDED) {
+    if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && is_reserved_key(int(e.key.scancode))) {
+        request_diag("");
+    } else if (e.type == SDL_EVENT_GAMEPAD_ADDED) {
         open_gamepad(e.gdevice.which);
     } else if (e.type == SDL_EVENT_GAMEPAD_REMOVED) {
         for (size_t i = 0; i < g_gamepads.size(); ++i) {

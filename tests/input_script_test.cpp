@@ -204,6 +204,22 @@ static void test_shot() {
     CHECK(h.script.take_shots().empty());
 }
 
+static void test_diag() {
+    Host h("wait 1; diag blur; wait 1; diag second");
+    h.tick();
+    CHECK(h.script.take_diags().empty());
+    h.tick();
+    CHECK(h.script.take_diags() == std::vector<std::string>{"blur"});
+    CHECK(h.script.take_diags().empty());
+    h.tick();
+    h.tick();
+    CHECK(h.script.take_diags() == std::vector<std::string>{"second"});
+    Script s;
+    std::string e;
+    CHECK(!s.parse("diag", e) && !s.parse("diag a b", e));
+    CHECK(s.parse("diag x", e) && s.commands()[0].kind == CmdKind::Diag);
+}
+
 static void test_trace_frame() {
     Host h("trace-frame; wait 1; trace-frame 3");
     h.tick();
@@ -292,6 +308,7 @@ int main() {
     test_wait_still();
     test_shot();
     test_trace_frame();
+    test_diag();
     test_log();
     test_stick();
     test_stick_until_file();

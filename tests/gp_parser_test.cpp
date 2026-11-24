@@ -6,11 +6,17 @@
 // documentation (see gp_parser.cpp), not from the decoder's own code.
 #include <cmath>
 #include <cstdio>
+#include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <vector>
 
+#include "diag.h"
 #include "gcrecomp/runtime.h"
 #include "gp_internal.h"
+#include "test_env.h"
 
 using namespace gcrecomp;
 using namespace gcrecomp::gp;
@@ -857,6 +863,69 @@ static Bytes call_cmd(uint32_t addr, uint32_t size) {
     return b;
 }
 
+// A diagnostic bundle (diag.h) covers the whole frame after the request: the XFB copy that ends the frame in progress starts it,
+// the next one ends it. Draws, their state and the copies of that frame go to diag.txt; nothing outside it does.
+static void test_diag_bundle() {
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() / ("gcrecomp-parser-diag-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    set_env("GCRECOMP_DIAG_DIR", root.string().c_str());
+    setup();
+    feed_all(cp(0x50, vcd_lo(false, 1)));
+    feed_all(cp(0x70, vat_a(1, 4, 0)));
+    auto tri = [] {
+        Bytes s = draw_cmd(kTriangles, 0, 3);
+        for (int i = 0; i < 9; ++i) putf(s, float(i));
+        feed_all(s);
+    };
+    feed_all(bp(0x49, 0));
+    feed_all(bp(0x4A, 639 | (479u << 10)));
+    tri();  // the frame in progress when the key is pressed
+    CHECK(diag::g_trigger.request("parser"));
+    feed_all(bp(0x52, 1u << 14));  // XFB copy: begins the bundle, belongs to the frame before
+    CHECK(diag::g_trigger.capturing());
+    CHECK(g_copies.size() == 1 && !g_copies[0].diag);
+    // The recorded frame: a draw, a draw with the same state, a texture copy through the deflicker filter, a draw with
+    // another state, the XFB copy.
+    tri();
+    tri();
+    feed_all(bp(0x53, 8 | (8u << 6) | (10u << 12) | (12u << 18)));
+    feed_all(bp(0x54, 10 | (8u << 6) | (8u << 12)));
+    feed_all(bp(0x52, 0x10));  // texture copy, format 1
+    feed_all(bp(0x40, 0x17));  // Z mode changes the state
+    tri();
+    CHECK(g_copies.size() == 2 && g_copies[1].diag);
+    feed_all(bp(0x52, 1u << 14));  // XFB copy: ends it
+    CHECK(g_copies.size() == 3 && g_copies[2].diag);
+    CHECK(!diag::g_trigger.capturing());
+    tri();  // later frames are not recorded
+    feed_all(bp(0x52, 1u << 14));
+    CHECK(g_copies.size() == 4 && !g_copies[3].diag);
+
+    fs::path dir;
+    for (const auto& e : fs::directory_iterator(root)) dir = e.path();
+    CHECK(dir.filename().string().rfind("diag-1-", 0) == 0 && dir.filename().string().find("-parser") != std::string::npos);
+    auto slurp = [](const fs::path& f) {
+        std::ifstream in(f, std::ios::binary);
+        std::stringstream ss;
+        ss << in.rdbuf();
+        return ss.str();
+    };
+    const std::string trace = slurp(dir / "diag.txt");
+    CHECK(trace.find("[DRAW] #1 ") != std::string::npos && trace.find("[DRAW] #3 ") != std::string::npos && trace.find("[DRAW] #4 ") == std::string::npos);
+    CHECK(trace.find("[DRAW] state of draw #2 = state of draw #1") != std::string::npos);
+    CHECK(trace.find("[DRAW] state of draw #3:") != std::string::npos);  // new state, written in full
+    CHECK(trace.find("[COPY] to_xfb=0") != std::string::npos && trace.find("[COPY] to_xfb=1") != std::string::npos);
+    CHECK(trace.find("taps 8 8 10 12 10 8 8: lines above/this/below = 16/32/16 of 64 (ACTIVE") != std::string::npos);
+    const std::string summary = slurp(dir / "summary.txt");
+    CHECK(summary.find("draws                        3") != std::string::npos);
+    CHECK(summary.find("efb copies to a texture      1") != std::string::npos && summary.find("efb copies to the XFB        1") != std::string::npos);
+    CHECK(summary.find("EFB copy vertical filter") != std::string::npos);
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    unset_env("GCRECOMP_DIAG_DIR");
+    g_graphics = false;
+}
+
 static void test_display_list_call() {
     setup();
     Bytes dl;
@@ -983,6 +1052,7 @@ int main() {
     test_display_list_call();
     test_wgp_write_paths();
     test_wgp_store_sizes();
+    test_diag_bundle();
     if (g_failures) {
         std::printf("%d failure(s)\n", g_failures);
         return 1;

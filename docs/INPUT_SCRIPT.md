@@ -35,6 +35,7 @@ condition holds, `press` does not block (the button is held while later commands
 | `wait-still N [T]` | Waits until `N` consecutive presented frames each differ from the previous one by at most `T` (default 0.05): the screen has settled. |
 | `trace-frame [N]` | Traces the draws of the `N`th next presented frame (default 1, the frame in progress) as `GP_TRACE_FRAME` does (see DEBUGGING.md), so a frame reached by events can be inspected without knowing its number. |
 | `shot NAME` | Writes the next presented frame as `NAME.ppm` in the screenshot directory (`TOS_SCREENSHOT_DIR` of the harness). |
+| `diag NAME` | Asks for a diagnostic bundle of the next presented frame, as F10 does in the window (docs/DEBUGGING.md, "The diagnostic bundle"): the directory `diag-<n>-<time>-NAME` with `diag.txt`, `summary.txt`, the window picture and the EFB at each copy. `NAME` is kept to `A-Z a-z 0-9 . _ -` (anything else becomes `_`). |
 
 Every wait accepts `timeout=SECONDS` (wall time), after which it is considered done, so one missed event
 does not hang a run. `wait-change` and `wait-still` also accept `threshold=T` instead of the positional value.
@@ -79,6 +80,7 @@ shot next
 * `tools/run-scripted.sh --script A --script B`: segments run in order; `--card-in FILE` starts from a given card image.
 * `tools/input-scripts/tos-load-save.txt` (load a save from the title menu; the save to load is chosen by uncommenting the `NEXT-SAVE` line once per save to skip) and `tos-village-to-field.txt` (from a save in the village of Isélia to the world map; chain them with two `--script` and `--card-in`).
 * `tools/input-scripts/tos-classroom.txt`, `tos-first-walk.txt`, `tos-menu.txt`: the next segments (the classroom cutscene, walking, the field menu; the last one is exploratory).
+* `tools/input-scripts/tos-diag-classroom.txt`: after `tos-new-game.txt`, asks for a diagnostic bundle of the classroom dialogue (`diag classroom`).
 * `tools/input-scripts/tos-new-game.txt`: example, Tales of Symphonia from a blank card to the opening classroom scene (the first dialogue).
 * `tools/input-scripts/tos-battle.txt`: Tales of Symphonia from a save (`--card-in`: the memorial circle in Iselia) to a battle on the field map and through it; see docs/BENCHMARK.md ("A battle").
 * `tools/input-scripts/tos-vidarr.txt`: from the third save of the owner's card (world map, Temple de Martel) into the temple, the first fights and the boss fight (needs `--card-in`); see docs/BENCHMARK.md ("The first temple boss"). Its menu steps depend on timing: check the `load-confirm` and `w1` screenshots.

@@ -23,6 +23,7 @@
 #include "gp_decode.h"
 #include "gp_internal.h"
 #include "input.h"
+#include "diag.h"
 
 namespace gcrecomp::gx {
 // Defined in src/gx/gx_texture.cpp.
@@ -774,6 +775,48 @@ void write_ppm(const char* path, const std::vector<uint8_t>& px) {
     }
 }
 
+// A diagnostic bundle's picture of the EFB (colour, and alpha apart) over the source rectangle of the copy that is about to
+// run: the stage of a screen-space effect built from copies. The XFB copy's picture is always kept, the texture copies' up
+// to diag::kMaxEfbImages.
+void diag_capture_efb(const CopyRequest& r, const State& s) {
+    diag::Bundle& b = diag::g_bundle;
+    if (!r.to_xfb && int(b.efb.size()) >= diag::kMaxEfbImages) {
+        ++b.efb_dropped;
+        return;
+    }
+    const int x = std::clamp(r.x, 0, kEfbWidth - 1), y = std::clamp(r.y, 0, kEfbHeight - 1);
+    const int w = std::min(r.w, kEfbWidth - x), h = std::min(r.h, kEfbHeight - y);
+    if (w <= 0 || h <= 0) return;
+    std::vector<uint8_t> rgba(size_t(w) * h * 4);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(x, kEfbHeight - (y + h), w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+    diag::Image im;
+    im.w = w;
+    im.h = h;
+    im.rgb.resize(size_t(w) * h * 3);
+    im.alpha.resize(size_t(w) * h);
+    for (int row = 0; row < h; ++row) {  // GL rows run bottom to top
+        const uint8_t* src = &rgba[size_t(h - 1 - row) * w * 4];
+        for (int col = 0; col < w; ++col) {
+            uint8_t* rgb = &im.rgb[(size_t(row) * w + col) * 3];
+            rgb[0] = src[col * 4];
+            rgb[1] = src[col * 4 + 1];
+            rgb[2] = src[col * 4 + 2];
+            im.alpha[size_t(row) * w + col] = src[col * 4 + 3];
+        }
+    }
+    if (r.to_xfb) {
+        im.label = "xfb";
+    } else {
+        char label[64];
+        std::snprintf(label, sizeof label, "copy%02llu-dest%06X-fmt%X", (unsigned long long)b.counts["efb copies to a texture"], (s.bp[0x4B] & 0xFFFFFF) << 5,
+                      ((s.bp[0x52] >> 4) & 7) | (((s.bp[0x52] >> 3) & 1) << 3));
+        im.label = label;
+    }
+    b.efb.push_back(std::move(im));
+}
+
 // Called after the frame is drawn and before it is swapped: periodic screenshots, the shots a script
 // asked for, and the picture signature a script waits on.
 void write_screenshot() {
@@ -840,6 +883,7 @@ bool init(int window_w, int window_h, const char* screenshot_dir, int max_screen
     SDL_GetWindowSizeInPixels(g_window, &g_window_w, &g_window_h);
     g_shot_dir = screenshot_dir;
     g_shot_max = max_screenshots;
+    diag::set_default_dir(screenshot_dir);
     std::fprintf(stderr, "[GL] %s, %s\n", reinterpret_cast<const char*>(glGetString(GL_RENDERER)),
                  reinterpret_cast<const char*>(glGetString(GL_VERSION)));
 
@@ -1105,6 +1149,7 @@ static void copy_efb_to_memory(const State& s, uint32_t copy_cmd) {
 }
 
 void copy_efb(const CopyRequest& r, const State& s) {
+    if (r.diag) diag_capture_efb(r, s);
     // An EFB copy changes framebuffer bindings, viewport, scissor, color and depth masks: forget what apply_state set.
     g_efb_bound = false;
     invalidate_shadow();
@@ -1131,6 +1176,12 @@ void copy_efb(const CopyRequest& r, const State& s) {
         const int sy0 = kEfbHeight - (r.y + r.h), sy1 = kEfbHeight - r.y;
         glBlitFramebuffer(r.x, sy0, r.x + r.w, sy1, 0, 0, g_window_w, g_window_h, GL_COLOR_BUFFER_BIT, GL_LINEAR);
         write_screenshot();
+        if (r.diag) {
+            diag::Image& win = diag::g_bundle.window;
+            win.w = g_window_w;
+            win.h = g_window_h;
+            win.rgb = read_window_rgb();
+        }
         SDL_GL_SwapWindow(g_window);
         SDL_GetWindowSizeInPixels(g_window, &g_window_w, &g_window_h);
     }
