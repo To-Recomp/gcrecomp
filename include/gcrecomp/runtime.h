@@ -313,6 +313,7 @@ struct Memory {
         const uint32_t off = addr - MAIN_RAM_BASE;
         if (GCRECOMP_LIKELY(off < ram_size)) {
             tick(addr);
+            guard_read(off, 1);
             return ram[off];
         }
         return read8_slow(addr);
@@ -321,6 +322,7 @@ struct Memory {
         const uint32_t off = addr - MAIN_RAM_BASE;
         if (GCRECOMP_LIKELY(off < ram_size)) {
             tick(addr);
+            guard_read(off, 2);
             uint16_t v;
             std::memcpy(&v, ram + off, 2);
             return big16(v);
@@ -331,6 +333,7 @@ struct Memory {
         const uint32_t off = addr - MAIN_RAM_BASE;
         if (GCRECOMP_LIKELY(off < ram_size)) {
             tick(addr);
+            guard_read(off, 4);
             uint32_t v;
             std::memcpy(&v, ram + off, 4);
             return big32(v);
@@ -418,6 +421,26 @@ struct Memory {
     void tick_slow(uint32_t addr) const;
     GCRECOMP_FORCE_INLINE void tick(uint32_t addr) const {
         if (GCRECOMP_UNLIKELY((++bench::g_mem_ops & 0x3FFFF) == 0)) tick_slow(addr);
+    }
+
+    // Read guard: up to 8 ranges of RAM (offsets from the start of RAM) whose bytes the GP module has not written yet (an EFB copy it
+    // keeps on the GPU, see docs/BENCHMARK.md). A read that touches one calls read_guard_hook(offset, length) first; the hook makes
+    // the bytes valid and updates the ranges with set_read_guard(). A store is not guarded: the write stamps tell the GP module
+    // about it. Costs one test of guard_count per read when nothing is guarded.
+    uint32_t guard_count = 0;
+    uint32_t guard_lo[8] = {};
+    uint32_t guard_hi[8] = {};  // exclusive
+    void (*read_guard_hook)(uint32_t off, uint32_t len) = nullptr;
+    void set_read_guard(const uint32_t* lo, const uint32_t* hi, uint32_t count) {
+        for (uint32_t i = 0; i < count && i < 8; ++i) {
+            guard_lo[i] = lo[i];
+            guard_hi[i] = hi[i];
+        }
+        guard_count = count < 8 ? count : 8;
+    }
+    void guard_read_slow(uint32_t off, uint32_t len) const;
+    GCRECOMP_FORCE_INLINE void guard_read(uint32_t off, uint32_t len) const {
+        if (GCRECOMP_UNLIKELY(guard_count != 0)) guard_read_slow(off, len);
     }
 
     // Write watch (GCRECOMP_WATCH=0xADDR:LEN[,0xADDR:LEN...], read by init()): every store that overlaps one of the
@@ -569,6 +592,8 @@ extern Memory     g_mem;
 // stream. Installed by the GP module; stores are absorbed by the hardware register space otherwise.
 // `size` is 1, 2, 4 or 8 bytes and `value` holds them big-endian.
 extern void (*g_wgp_write)(uint32_t size, uint64_t value);
+// Called by the GXDrawDone replacement: the GP module writes what it keeps on the GPU to guest memory (null: nothing to do).
+extern void (*g_gp_sync)();
 
 // Called at every VI retrace, on the thread that takes the interrupt (window events are pumped here).
 extern void (*g_retrace_hook)();

@@ -493,6 +493,9 @@ private:
             uint8_t* pe = g_mem.hw_regs + (0xCC00100E - Memory::HW_REG_BASE);
             pe[0] = uint8_t(value >> 8);
             pe[1] = uint8_t(value);
+            if (g_graphics) renderer::flush_copies();
+        } else if (reg == 0x45) {
+            if (g_graphics) renderer::flush_copies();  // GXSetDrawDone
         } else if (reg == 0x52) {
             efb_copy(value);
         }

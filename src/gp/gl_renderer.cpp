@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -19,6 +20,7 @@
 #include "gcrecomp/gx/gx.h"
 #include "gcrecomp/runtime.h"
 #include "efb_copy.h"
+#include "efb_gpu_copy.h"
 #include "gl_loader.h"
 #include "gp_decode.h"
 #include "gp_internal.h"
@@ -295,6 +297,32 @@ void main() {
 }
 )";
 
+// The copy to a GPU-resident texture (docs/BENCHMARK.md, "EFB copies on the GPU"): one full-screen triangle that writes the copied
+// EFB rectangle as the RGB565 format keeps it (5-6-5 bits, expanded back to 8 the way gx::decode_texture does), top row first.
+const char* kCopyFragmentShader = R"(#version 330 core
+uniform sampler2D u_efb;
+uniform ivec2 u_origin;  // EFB texel (GL rows) of the copy's top-left pixel; rows of the copy go down from there
+uniform ivec2 u_size;    // the copied rectangle in texels
+uniform ivec2 u_mode;    // x: 1 when the copy is half scaled (2x2 box filter); y: 0 RGB565, 1 RGBA8
+out vec4 o_color;
+uvec4 texel(int x, int y) {
+    return uvec4(round(texelFetch(u_efb, ivec2(u_origin.x + min(x, u_size.x - 1), u_origin.y - min(y, u_size.y - 1)), 0) * 255.0));
+}
+void main() {
+    ivec2 f = ivec2(gl_FragCoord.xy);
+    uvec4 c;
+    if (u_mode.x != 0) {
+        c = (texel(f.x * 2, f.y * 2) + texel(f.x * 2 + 1, f.y * 2) + texel(f.x * 2, f.y * 2 + 1) + texel(f.x * 2 + 1, f.y * 2 + 1)) >> 2;
+    } else {
+        c = texel(f.x, f.y);
+    }
+    if (u_mode.y == 0) {
+        c = uvec4((c.r >> 3) * 255u / 31u, (c.g >> 2) * 255u / 63u, (c.b >> 3) * 255u / 31u, 255u);
+    }
+    o_color = vec4(c) / 255.0;
+}
+)";
+
 GLuint compile(GLenum type, const char* source) {
     GLuint shader = glCreateShader(type);
     glShaderSource(shader, 1, &source, nullptr);
@@ -333,6 +361,33 @@ struct CachedTexture {
     bool params_valid = false;
 };
 std::unordered_map<uint64_t, CachedTexture> g_textures;
+
+// EFB copies kept on the GPU. A copy to memory in a simple format is drawn into a GL texture (g_copy_gl[slot]) and read back
+// asynchronously (PBO + fence); draws that sample its guest address take the texture, and the guest bytes are written
+// when the game synchronises with the GPU (draw-sync token, draw done), before any texture decode that reads them, or
+// before a later copy overlaps them. GP_EFB_COPY_SYNC=1 reads every copy back at once, as before.
+CopyTracker g_copy_tracker;
+struct GpuCopyGl {
+    GLuint tex = 0;
+    int tw = 0, th = 0;
+    SamplerParams params;
+    bool params_valid = false;
+};
+GpuCopyGl g_copy_gl[CopyTracker::kSlots];
+struct PendingReadback {
+    GLuint pbo;
+    GLsync fence;
+    EfbCopyParams p;
+    uint32_t addr;
+    int slot;
+    uint64_t frame;  // frames presented when the copy was made
+};
+std::vector<PendingReadback> g_pending;
+std::vector<GLuint> g_pbo_free;
+GLuint g_copy_program = 0, g_copy_fbo = 0;
+GLint g_copy_origin_loc = -1, g_copy_size_loc = -1, g_copy_mode_loc = -1;
+bool g_copy_sync = std::getenv("GP_EFB_COPY_SYNC") != nullptr;
+std::thread::id g_gl_thread;  // the thread that made the GL context current: only it may call GL
 
 // The texture bound to each unit and the active unit, so that a draw that uses what the previous one used issues no GL
 // call. ~0u / -1: unknown.
@@ -380,6 +435,157 @@ uint64_t hash_bytes(const uint8_t* p, size_t n) {
     return r;
 }
 
+// The guest ranges of the pending copies are what a CPU read must not see before the copy is written.
+void update_read_guard() {
+    uint32_t lo[8], hi[8], n = 0;
+    for (const PendingReadback& pr : g_pending) {
+        if (n == 8) break;
+        lo[n] = pr.addr;
+        hi[n] = pr.addr + g_copy_tracker.at(pr.slot).extent;
+        ++n;
+    }
+    g_mem.set_read_guard(lo, hi, n);
+}
+
+void flush_overlapping(uint32_t addr, uint32_t len);
+
+// Memory::read_guard_hook: the CPU (or the host on its behalf) reads bytes of a copy the GPU has not delivered yet.
+void read_guard_hit(uint32_t off, uint32_t len) {
+    if (std::this_thread::get_id() != g_gl_thread) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr, "[GL] a thread other than the renderer's read an EFB copy that is not written yet (GP_EFB_COPY_SYNC=1 avoids this)\n");
+        }
+        return;
+    }
+    ++g_render_stats.efb_guard_hits;
+    flush_overlapping(off, len);
+}
+
+// Writes the guest bytes of the pending copy at g_pending[i]: waits for the GPU, reads the PBO, encodes. A store by the CPU
+// into the range since the copy was made wins on its pages (the copy came first on the console), and the GPU copy is dropped.
+void flush_pending_at(size_t i) {
+    const PendingReadback pr = g_pending[i];
+    g_pending.erase(g_pending.begin() + std::ptrdiff_t(i));
+    update_read_guard();  // before the bytes are touched: this copy's own range must not trap
+    const size_t w = size_t(pr.p.w), h = size_t(pr.p.h);
+    static std::vector<uint8_t> rgba, tmp;
+    rgba.resize(w * h * 4);
+    {
+        bench::ScopedNs timer(g_render_stats.readback_ns);
+        for (;;) {
+            const GLenum r = glClientWaitSync(pr.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+            if (r != GL_TIMEOUT_EXPIRED) break;  // signaled, or an error (nothing better to do): go on
+        }
+        glDeleteSync(pr.fence);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, pr.pbo);
+        const uint8_t* mapped = static_cast<const uint8_t*>(glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, GLsizeiptr(rgba.size()), GL_MAP_READ_BIT));
+        if (mapped) {
+            for (size_t r = 0; r < h; ++r) std::memcpy(&rgba[r * w * 4], mapped + (h - 1 - r) * w * 4, w * 4);  // GL rows run bottom to top
+            glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+        }
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    }
+    g_pbo_free.push_back(pr.pbo);
+    GpuCopy& c = g_copy_tracker.at(pr.slot);
+    const uint32_t extent = c.extent;
+    const bool stale = g_mem.written_since(pr.addr, extent, c.clock);
+    uint8_t* dst = const_cast<uint8_t*>(g_mem.read_ptr(pr.addr));  // stamped as a whole below, after the decision
+    if (!stale) {
+        encode_efb_copy(pr.p, rgba.data(), nullptr, dst);
+    } else {
+        tmp.assign(extent, 0);
+        encode_efb_copy(pr.p, rgba.data(), nullptr, tmp.data());
+        for (uint32_t a = pr.addr; a < pr.addr + extent;) {
+            const uint32_t end = std::min((a | 0xFFFu) + 1, pr.addr + extent);
+            if (!g_mem.written_since(a, end - a, c.clock)) std::memcpy(dst + (a - pr.addr), tmp.data() + (a - pr.addr), end - a);
+            a = end;
+        }
+    }
+    // GP_EFB_COPY_VERIFY=1: the GPU copy must equal what the texture decoder makes of the bytes just written (any difference is
+    // reported once per kind of copy, with its largest channel error).
+    static const bool verify = std::getenv("GP_EFB_COPY_VERIFY") != nullptr;
+    if (verify && !stale) {
+        int ow, oh;
+        efb_copy_output_size(pr.p, &ow, &oh);
+        const GpuCopyGl& gl = g_copy_gl[pr.slot];
+        const std::vector<uint8_t> want = gx::decode_texture(dst, uint32_t(ow), uint32_t(oh), gx::GXTexFmt(pr.p.format));
+        std::vector<uint8_t> got(size_t(ow) * oh * 4);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_copy_fbo);
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gl.tex, 0);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(0, 0, ow, oh, GL_RGBA, GL_UNSIGNED_BYTE, got.data());
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
+        int worst = 0;
+        size_t bad = 0;
+        for (size_t k = 0; k < got.size(); ++k) {
+            const int d = std::abs(int(got[k]) - int(want[k]));
+            worst = std::max(worst, d);
+            bad += d != 0;
+        }
+        static uint64_t checked = 0, mismatched = 0;
+        ++checked;
+        if (bad) ++mismatched;
+        if (bad && mismatched <= 5)
+            std::fprintf(stderr, "[GL] EFB copy VERIFY: format %u %dx%d half=%d at 0x%06X: %zu of %zu bytes differ, largest %d\n", pr.p.format, ow, oh,
+                         pr.p.half_scale, pr.addr, bad, got.size(), worst);
+        if (checked % 600 == 0) std::fprintf(stderr, "[GL] EFB copy VERIFY: %llu copies checked, %llu differ\n", (unsigned long long)checked, (unsigned long long)mismatched);
+    }
+    g_mem.mark_written(pr.addr | Memory::MAIN_RAM_BASE, extent);  // the cached textures made from this memory are stale
+    g_copy_tracker.mark_written(pr.slot, g_mem.advance_clock());
+    if (stale) g_copy_tracker.invalidate(pr.slot);
+    ++g_render_stats.efb_flushes;
+}
+
+void flush_slot(int slot) {
+    for (size_t i = 0; i < g_pending.size(); ++i)
+        if (g_pending[i].slot == slot) {
+            flush_pending_at(i);
+            return;
+        }
+}
+
+// Before guest bytes of [addr, addr + len) are read or overwritten by anything but the CPU.
+void flush_overlapping(uint32_t addr, uint32_t len) {
+    int slots[CopyTracker::kSlots];
+    const int n = g_copy_tracker.pending_overlapping(addr, len, slots);
+    for (int i = 0; i < n; ++i) flush_slot(slots[i]);
+}
+
+void flush_all_copies() {
+    while (!g_pending.empty()) flush_pending_at(0);
+}
+
+SamplerParams wanted_sampler(uint32_t mode0, uint32_t mode1, uint32_t levels) {
+    static const GLint wrap[3] = {GL_CLAMP_TO_EDGE, GL_REPEAT, GL_MIRRORED_REPEAT};
+    static const GLint min_filters[6] = {GL_NEAREST, GL_NEAREST_MIPMAP_NEAREST, GL_NEAREST_MIPMAP_LINEAR,
+                                         GL_LINEAR,  GL_LINEAR_MIPMAP_NEAREST,  GL_LINEAR_MIPMAP_LINEAR};
+    SamplerParams want;
+    want.wrap_s = wrap[(mode0 & 3) % 3];
+    want.wrap_t = wrap[((mode0 >> 2) & 3) % 3];
+    want.mag = (mode0 & 0x10) ? GL_LINEAR : GL_NEAREST;
+    want.min = min_filters[uint32_t(effective_min_filter(mode0, levels))];
+    want.lod_bias = lod_bias_of(mode0);
+    want.min_lod = min_lod_of(mode1);
+    want.max_lod = max_lod_of(mode1);
+    return want;
+}
+
+void apply_sampler(int map, GLuint id, SamplerParams& cache, bool& valid, const SamplerParams& want) {
+    if (valid && cache == want) return;
+    edit_unit_texture(map, id);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, want.wrap_s);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, want.wrap_t);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, want.mag);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, want.min);
+    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_LOD_BIAS, want.lod_bias);
+    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_LOD, want.min_lod);
+    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_LOD, want.max_lod);
+    cache = want;
+    valid = true;
+}
+
 GLuint texture_for_map(const State& s, int map) {
     const uint32_t img0 = s.bp[map < 4 ? 0x88 + map : 0xA8 + (map - 4)];
     const uint32_t img3 = s.bp[map < 4 ? 0x94 + map : 0xB4 + (map - 4)];
@@ -391,6 +597,24 @@ GLuint texture_for_map(const State& s, int map) {
     const uint32_t settlut = indexed ? s.bp[map < 4 ? 0x98 + map : 0xB8 + (map - 4)] : 0;
     const uint32_t levels = mip_level_count(w, h, mode0, mode1);
     const size_t bytes = mip_chain_bytes(w, h, fmt, levels);
+    if (!g_copy_sync && levels == 1 && !indexed) {
+        const int slot = g_copy_tracker.find(addr, w, h, uint8_t(fmt));
+        if (slot >= 0) {
+            GpuCopy& c = g_copy_tracker.at(slot);
+            if (g_mem.written_since(addr, c.extent, c.clock)) {
+                // The CPU stored into the copy's bytes: guest memory is the truth from now on.
+                if (c.pending) flush_slot(slot);
+                g_copy_tracker.invalidate(slot);
+            } else {
+                GpuCopyGl& gl = g_copy_gl[slot];
+                ++g_render_stats.efb_gpu_hits;
+                bind_unit_texture(map, gl.tex);
+                apply_sampler(map, gl.tex, gl.params, gl.params_valid, wanted_sampler(mode0, mode1, levels));
+                return gl.tex;
+            }
+        }
+    }
+    if (!g_pending.empty()) flush_overlapping(addr, uint32_t(bytes));
     const uint8_t* src = g_mem.read_ptr(addr);
     const uint64_t key = (uint64_t(addr) << 24) ^ (uint64_t(w) << 12) ^ (uint64_t(h) << 4) ^ fmt ^ (uint64_t(levels) << 56);
     CachedTexture& t = g_textures[key];
@@ -484,29 +708,7 @@ GLuint texture_for_map(const State& s, int map) {
         t.params_valid = false;
     }
     bind_unit_texture(map, t.id);
-    static const GLint wrap[3] = {GL_CLAMP_TO_EDGE, GL_REPEAT, GL_MIRRORED_REPEAT};
-    static const GLint min_filters[6] = {GL_NEAREST, GL_NEAREST_MIPMAP_NEAREST, GL_NEAREST_MIPMAP_LINEAR,
-                                         GL_LINEAR,  GL_LINEAR_MIPMAP_NEAREST,  GL_LINEAR_MIPMAP_LINEAR};
-    SamplerParams want;
-    want.wrap_s = wrap[(mode0 & 3) % 3];
-    want.wrap_t = wrap[((mode0 >> 2) & 3) % 3];
-    want.mag = (mode0 & 0x10) ? GL_LINEAR : GL_NEAREST;
-    want.min = min_filters[uint32_t(effective_min_filter(mode0, levels))];
-    want.lod_bias = lod_bias_of(mode0);
-    want.min_lod = min_lod_of(mode1);
-    want.max_lod = max_lod_of(mode1);
-    if (!t.params_valid || !(t.params == want)) {
-        edit_unit_texture(map, t.id);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, want.wrap_s);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, want.wrap_t);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, want.mag);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, want.min);
-        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_LOD_BIAS, want.lod_bias);
-        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_LOD, want.min_lod);
-        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_LOD, want.max_lod);
-        t.params = want;
-        t.params_valid = true;
-    }
+    apply_sampler(map, t.id, t.params, t.params_valid, wanted_sampler(mode0, mode1, levels));
     return t.id;
 }
 
@@ -905,6 +1107,8 @@ bool init(int window_w, int window_h, const char* screenshot_dir, int max_screen
         return false;
     }
     g_context = SDL_GL_CreateContext(g_window);
+    g_gl_thread = std::this_thread::get_id();
+    g_mem.read_guard_hook = &read_guard_hit;
     if (!g_context) {
         std::fprintf(stderr, "[GL] cannot create an OpenGL 3.3 context: %s\n", SDL_GetError());
         return false;
@@ -1002,6 +1206,32 @@ bool init(int window_w, int window_h, const char* screenshot_dir, int max_screen
         glGenVertexArrays(1, &g_present_vao);
     }
 
+    // The pass that keeps an EFB copy as a texture.
+    {
+        const GLuint cfs = compile(GL_FRAGMENT_SHADER, kCopyFragmentShader);
+        const GLuint cvs = compile(GL_VERTEX_SHADER, kPresentVertexShader);
+        GLint ok = 0;
+        if (cvs && cfs) {
+            g_copy_program = glCreateProgram();
+            glAttachShader(g_copy_program, cvs);
+            glAttachShader(g_copy_program, cfs);
+            glLinkProgram(g_copy_program);
+            glGetProgramiv(g_copy_program, GL_LINK_STATUS, &ok);
+        }
+        if (!ok) {
+            std::fprintf(stderr, "[GL] the EFB copy pass did not build: copies are read back at once\n");
+            g_copy_program = 0;
+        } else {
+            g_copy_origin_loc = glGetUniformLocation(g_copy_program, "u_origin");
+            g_copy_size_loc = glGetUniformLocation(g_copy_program, "u_size");
+            g_copy_mode_loc = glGetUniformLocation(g_copy_program, "u_mode");
+            glUseProgram(g_copy_program);
+            glUniform1i(glGetUniformLocation(g_copy_program, "u_efb"), kEfbUnit);
+            glUseProgram(g_program);
+            glGenFramebuffers(1, &g_copy_fbo);
+        }
+    }
+
     glGenVertexArrays(1, &g_vao);
     glGenBuffers(1, &g_vbo);
     glBindVertexArray(g_vao);
@@ -1020,7 +1250,20 @@ bool init(int window_w, int window_h, const char* screenshot_dir, int max_screen
     return true;
 }
 
+void flush_copies() {
+    // A sync point: write the copies the GPU has finished, and any that is two frames old. The others stay pending: a read of their
+    // bytes by the CPU is caught by the read guard (Memory::read_guard_hook) and writes them then.
+    for (size_t i = 0; i < g_pending.size();) {
+        const GLenum r = g_frames - g_pending[i].frame >= 2 ? GL_ALREADY_SIGNALED : glClientWaitSync(g_pending[i].fence, 0, 0);
+        if (r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED) flush_pending_at(i);
+        else ++i;
+    }
+}
+
 void shutdown() {
+    flush_all_copies();
+    g_mem.read_guard_hook = nullptr;
+    g_mem.guard_count = 0;
     print_feature_use();
     if (g_context) SDL_GL_DestroyContext(g_context);
     if (g_window) SDL_DestroyWindow(g_window);
@@ -1209,6 +1452,84 @@ static void present_filtered(const CopyRequest& r, const State& s, const CopyFil
 // Copy a region of the EFB to main memory in the console's tiled layout (BP 0x52 with the XFB bit
 // clear). Reads back from the GPU. The texture cache keys on a hash of the guest bytes, so entries
 // overlapping the destination are re-decoded on their next use without explicit invalidation.
+// True when the destination rows follow each other without a gap: the texture decoder reads the copy as one packed image.
+static bool copy_is_packed(const EfbCopyParams& p) {
+    int ow, oh, tw, th, tb;
+    efb_copy_output_size(p, &ow, &oh);
+    efb_copy_tile_geometry(p, &tw, &th, &tb);
+    return p.stride == uint32_t((ow + tw - 1) / tw) * uint32_t(tb);
+}
+
+// Keeps the copy as a GL texture and starts its read-back; false when there is no slot or buffer to do it (the caller reads back
+// at once).
+static bool copy_to_gpu(const EfbCopyParams& p, uint32_t addr, uint32_t extent) {
+    if (g_copy_tracker.pending_count() >= 6) flush_all_copies();
+    GpuCopy fresh;
+    fresh.addr = addr;
+    fresh.extent = extent;
+    int ow, oh;
+    efb_copy_output_size(p, &ow, &oh);
+    fresh.w = uint32_t(ow);
+    fresh.h = uint32_t(oh);
+    fresh.fmt = p.format;
+    fresh.clock = g_mem.advance_clock();
+    const int slot = g_copy_tracker.begin(fresh);
+    if (slot < 0) return false;
+    GpuCopyGl& gl = g_copy_gl[slot];
+    if (!gl.tex) glGenTextures(1, &gl.tex);
+    if (gl.tw != ow || gl.th != oh) {
+        edit_unit_texture(kEfbUnit, gl.tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ow, oh, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        gl.tw = ow;
+        gl.th = oh;
+        gl.params_valid = false;
+        bind_unit_texture(kEfbUnit, g_white);
+    }
+    // The copy as a texture.
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_copy_fbo);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gl.tex, 0);
+    glViewport(0, 0, ow, oh);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_COLOR_LOGIC_OP);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glUseProgram(g_copy_program);
+    glBindVertexArray(g_present_vao);
+    bind_unit_texture(kEfbUnit, g_color);
+    glUniform2i(g_copy_origin_loc, p.x, kEfbHeight - 1 - p.y);
+    glUniform2i(g_copy_size_loc, p.w, p.h);
+    glUniform2i(g_copy_mode_loc, p.half_scale ? 1 : 0, p.format == uint8_t(EfbCopyFormat::RGBA8) ? 1 : 0);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    bind_unit_texture(kEfbUnit, g_white);
+    glBindVertexArray(g_vao);
+    glUseProgram(g_program);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+    invalidate_shadow();  // viewport, scissor, blend, depth, cull and colour mask were changed here
+    g_efb_bound = true;
+    // The bytes: read back through a buffer, written when the game synchronises.
+    GLuint pbo;
+    if (!g_pbo_free.empty()) {
+        pbo = g_pbo_free.back();
+        g_pbo_free.pop_back();
+    } else {
+        glGenBuffers(1, &pbo);
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
+    glBufferData(GL_PIXEL_PACK_BUFFER, GLsizeiptr(size_t(p.w) * p.h * 4), nullptr, GL_STREAM_READ);
+    glReadPixels(p.x, kEfbHeight - (p.y + p.h), p.w, p.h, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    g_pending.push_back({pbo, glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0), p, addr, slot, g_frames});
+    update_read_guard();
+    ++g_render_stats.efb_gpu_copies;
+    return true;
+}
+
 static void copy_efb_to_memory(const State& s, uint32_t copy_cmd) {
     EfbCopyParams p = make_efb_copy_params(copy_cmd, s.bp[0x49], s.bp[0x4A], s.bp[0x4D], s.bp[0x4E],
                                            (s.bp[0x43] & 7) == 3);
@@ -1230,6 +1551,26 @@ static void copy_efb_to_memory(const State& s, uint32_t copy_cmd) {
         copy_filter_margins(p, kEfbHeight, &above, &below);
         ++g_use.filtered_copies;
     }
+    // GP_TRACE_COPY=1: every distinct kind of copy to memory, once (format, size, stride, scaling), and whether it stays on the GPU.
+    static const bool trace_copy = std::getenv("GP_TRACE_COPY") != nullptr;
+    if (trace_copy) {
+        static std::vector<uint64_t> seen;
+        const uint64_t sig = uint64_t(p.format) | uint64_t(p.half_scale) << 4 | uint64_t(p.y_scale) << 5 | uint64_t(p.depth) << 6 |
+                             uint64_t(filter.identity()) << 7 | uint64_t(p.w) << 8 | uint64_t(p.h) << 20 | uint64_t(p.stride) << 32;
+        if (std::find(seen.begin(), seen.end(), sig) == seen.end()) {
+            seen.push_back(sig);
+            std::fprintf(stderr, "[COPY] to memory: format %u %dx%d stride %u half=%d yscale=%d (reg %u) depth=%d filter identity=%d dest=0x%06X\n", p.format, p.w, p.h,
+                         p.stride, p.half_scale, p.y_scale, p.y_scale_reg, p.depth, filter.identity(), addr);
+        }
+    }
+    // What this copy overwrites must not be written later by an older pending copy, nor sampled from a GPU copy any more.
+    const uint32_t extent = uint32_t(efb_copy_extent(p));
+    flush_overlapping(addr, extent);
+    g_copy_tracker.invalidate_overlapping(addr, extent);
+    // The RGB565 and RGBA8 colour copies (full size or half scaled) written as the texture decoder reads them, stay on the GPU.
+    if (!g_copy_sync && g_copy_program && !p.depth && (p.format == uint8_t(EfbCopyFormat::RGB565) || p.format == uint8_t(EfbCopyFormat::RGBA8)) &&
+        !(p.y_scale && p.y_scale_reg != 0) && filter.identity() && copy_is_packed(p) && copy_to_gpu(p, addr, extent))
+        return;
     const int rows = p.h + above + below;
     glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);

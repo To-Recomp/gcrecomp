@@ -7,6 +7,16 @@
 
 using gcrecomp::Memory;
 
+static int g_hits = 0;
+static uint32_t g_hit_off = 0, g_hit_len = 0;
+static Memory* g_guarded = nullptr;
+static void on_guard(uint32_t off, uint32_t len) {
+    ++g_hits;
+    g_hit_off = off;
+    g_hit_len = len;
+    g_guarded->guard_count = 0;  // the hook delivers the bytes and drops the range
+}
+
 static int g_failures = 0;
 #define CHECK(c)                                                              \
     do {                                                                      \
@@ -95,6 +105,32 @@ int main() {
         CHECK(g_mem_ops == ops + 8);
         m.read64(base + 0x10); m.write64(base + 0x10, 1);
         CHECK(g_mem_ops == ops + 12);
+    }
+
+    // The read guard: a read touching a guarded range calls the hook (once: it drops the range), others do not.
+    {
+        g_guarded = &m;
+        m.read_guard_hook = &on_guard;
+        const uint32_t lo[2] = {0x2000, 0x8000}, hi[2] = {0x3000, 0x8010};
+        m.set_read_guard(lo, hi, 2);
+        g_hits = 0;
+        m.read32(base + 0x1FFC);  // ends where the range begins
+        m.read32(base + 0x3000);  // begins where it ends
+        m.read8(base + 0x7FFF);
+        m.write32(base + 0x2800, 1);  // stores are not guarded
+        CHECK(g_hits == 0);
+        m.read16(base + 0x1FFF + 1);
+        CHECK(g_hits == 1 && g_hit_off == 0x2000 && g_hit_len == 2);
+        m.read32(base + 0x2000);  // the hook dropped the guard
+        CHECK(g_hits == 1);
+        m.set_read_guard(lo, hi, 2);
+        m.read8(Memory::UNCACHED_BASE + 0x800F + 1 - 1 + 0);  // through another mirror's slow path
+        CHECK(g_hits == 2 && g_hit_off == 0x800F);
+        m.set_read_guard(lo, hi, 2);
+        (void)m.read_ptr(base + 0x2A00);  // a host pointer into the range
+        CHECK(g_hits == 3 && g_hit_off == 0x2A00);
+        m.read_guard_hook = nullptr;
+        m.guard_count = 0;
     }
 
     // The Memory is still correct.

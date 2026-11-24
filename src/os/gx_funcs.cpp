@@ -14,7 +14,9 @@ namespace gcrecomp {
 namespace {
 
 // GXDrawDone(void)
-void gx_draw_done(PPCContext*, Memory*) {}
+void gx_draw_done(PPCContext*, Memory*) {
+    if (g_gp_sync) g_gp_sync();
+}
 
 struct Entry {
     const char* name;

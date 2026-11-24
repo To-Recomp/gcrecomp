@@ -178,8 +178,24 @@ void Memory::tick_slow(uint32_t addr) const {
     }
 }
 
+void Memory::guard_read_slow(uint32_t off, uint32_t len) const {
+    if (!read_guard_hook) return;
+    for (uint32_t i = 0; i < guard_count; ++i) {
+        if (uint64_t(off) < guard_hi[i] && uint64_t(off) + len > guard_lo[i]) {
+            read_guard_hook(off, len);  // updates the ranges
+            return;
+        }
+    }
+}
+
 uint8_t* Memory::translate_impl(uint32_t addr) {
     tick(addr);
+    if (guard_count) {
+        // Any of the RAM mirrors: one byte at the address (a host pointer's reader may read on, which the hook cannot know).
+        if (addr >= MAIN_RAM_BASE && addr < ram_end) guard_read_slow(addr - MAIN_RAM_BASE, 1);
+        else if (addr >= UNCACHED_BASE && addr < UNCACHED_BASE + ram_size) guard_read_slow(addr - UNCACHED_BASE, 1);
+        else if (addr < ram_size) guard_read_slow(addr, 1);
+    }
     // Cached region: 0x80000000 - 0x80000000+ram_size
     if (addr >= MAIN_RAM_BASE && addr < ram_end) {
         return ram + (addr - MAIN_RAM_BASE);
@@ -382,6 +398,7 @@ static void hw_write16_hle(Memory* mem, uint32_t addr, uint16_t val) {
 
 // Big-endian writes
 void (*g_wgp_write)(uint32_t size, uint64_t value) = nullptr;
+void (*g_gp_sync)() = nullptr;
 
 static constexpr uint32_t kWgpAddr = 0xCC008000;
 
