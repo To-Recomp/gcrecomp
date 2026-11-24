@@ -23,6 +23,7 @@ stderr (`src/gp/bench.cpp`, `include/gcrecomp/bench.h`). It costs nothing when t
 | `texhash`, `texhash_bytes` | uses of a texture that read its guest bytes again to see whether they changed (the page write stamps skip this while nothing stored to the texture's pages), and the bytes read. |
 | `efbmem`, `efbmem_px` | EFB-to-memory copies (read back from the GPU and encoded) and the pixels they read. |
 | `parse_ms`, `draw_ms`, `readback_ms`, `swap_ms` | wall milliseconds per second spent in `Parser::draw` (vertex decode, transform, lighting, **including** the renderer call), in `renderer::draw` alone (state, vertex upload, GL calls), in the `glReadPixels` of EFB-to-memory copies (the wait for the GPU) and in the blit and buffer swap of a presented frame. Measured with two clock reads per call only while `GCRECOMP_BENCH` is set (about 5% overhead at 500 000 draws a second). `parse_ms - draw_ms` is the decode. |
+| `efbgpu`, `efbgpu_hits`, `efbflush`, `efbguard` | EFB copies kept on the GPU, texture uses served by such a copy (no decode), copies whose bytes were written to guest memory, and CPU reads that caught a copy not yet written (see "EFB copies on the GPU"). |
 | `cpu` | CPU time of the whole process over wall time (100% = one core). `threads` lists the threads above 1%: the guest/main thread, the GL driver threads (`gdrv`, `gl`), audio. |
 | `idle` | share of wall time every guest thread was blocked waiting for the retrace or an alarm (`sched::idle_ns`). High: the VI clock throttles the game, the host has CPU to spare. About 0 with `fps` below 60: flat out, the host is the limit. |
 
@@ -233,3 +234,34 @@ frame in the 30 fps stretches `renderer::draw` 5.6 -> 6.0 ms (unchanged, noise) 
 at almost every draw and gain nothing, which also rules out merging identical-state draws as the cure for them. Pictures: `GP_APPLY_ALWAYS` against the default on the scripted
 scene, RMSE 0.00 to 0.73 (only the idle sway of the characters differs between two runs, the difference image shows edges only).
 What is left in the boss profile (perf): `Parser::draw` (vertex decode and transform) 20%, `light_vertex` + `light_factor` + `transform_normal` 9%, the Mesa glthread 12%, `memmove` 5%.
+
+## EFB copies on the GPU
+
+What the owner's RX 7800 XT showed in the boss fight: 12.6 ms of every 32 ms frame were `readback_ms`, the synchronous `glReadPixels` of the once-a-frame EFB copy
+(a full pipeline drain: the GL driver thread and the GPU finish every draw queued before it). The copies of that scene are RGB565 and RGBA8, at full size
+and half scaled (the zoom blur and the battle-start shards sample them).
+
+A copy to memory in one of those formats (no Y scale, no vertical filter, destination rows packed as the texture decoder reads them) is now
+1. drawn into a GL texture by a full-screen pass that applies the format's quantisation (5-6-5 bits expanded to 8 as `gx::decode_texture` does, or RGBA8; the 2x2 box filter of a half-scaled copy as `encode_efb_copy` does it, truncating `>> 2`);
+2. read back into a pixel buffer object with a fence, without waiting;
+3. written to guest memory (`encode_efb_copy`) later, when its fence has signalled at a sync point (draw-sync token, PE finish, `GXDrawDone`), or once it is two frames old.
+
+Draws that sample the copy's address, size and format (`texture_for_map`) bind the texture instead of decoding guest memory. Exactness:
+* a CPU **read** of the copy's bytes before they are written is caught by the read guard (`Memory::read_guard_hook`, one test of `guard_count` per read when nothing is guarded) and writes the copy first, waiting for the GPU if need be (`efbguard` counts these: 0 in the boss fight, the battle and the world map of ToS);
+* a CPU **store** into the range after the copy wins on its pages (the write stamps say so; the GPU copy is dropped), as it did when the copy was written at once;
+* a texture decode that overlaps the range, and a later copy that overlaps it, write the pending copy first; a thread other than the renderer's that reads a pending copy gets a warning (it cannot call GL);
+* `GP_EFB_COPY_SYNC=1` reads every copy back at once as before. `GP_EFB_COPY_VERIFY=1` compares every GPU copy with what the texture decoder makes of the bytes written for it (0 of 6 000 differ in the boss fight, which uses all four kinds; it forces a sync read per copy, so it is slow); `GP_TRACE_COPY=1` lists the kinds of copy to memory.
+
+Bytes read through a host pointer by the host itself (an HLE routine copying out of the range) are only caught at the first byte (`Memory::translate`).
+
+Result on the iGPU test box (Radeon 610M, headless; `tos-vidarr.txt`, boss segment of 41 s, one run each; the owner's 7800 XT is the acceptance machine):
+
+| build | boss fps (mean / min) | seconds under 35 fps | `readback_ms` a second (mean / max) | main thread CPU |
+| --- | --- | --- | --- | --- |
+| `GP_EFB_COPY_SYNC=1` (the old behaviour) | 42.4 / 29 | 20 of 41 | 144 / 317 | 59% |
+| copies on the GPU, written at the sync point (waiting for the GPU there: no gain, the wait only moves) | 41.4 / 30 | 22 | 140 / 287 | 59% |
+| copies on the GPU, written when ready or at two frames, read guard | **58.7 / 49** | **0** | **8 / 36** | 80% |
+
+`tos-battle.txt` (the owner's other card): 9 039 of 9 476 copies stay on the GPU, `GP_EFB_COPY_VERIFY` finds 0 of 7 200 checked different, 0 guard hits, 0 unknown GP commands.
+Pictures: the scripted cutscene frames of the two builds compare at RMSE 0.00 to 0.9 (idle sway of characters and the world map's camera), the battle-start shatter effect, which samples the copy, looks as expected.
+With the stall gone the main thread is the limit (80% of a core at 59 fps): the next costs are the ones listed above (vertex decode, lighting, GL calls).

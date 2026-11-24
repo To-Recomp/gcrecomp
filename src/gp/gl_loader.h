@@ -25,8 +25,18 @@ typedef int GLsizei;
 typedef std::ptrdiff_t GLsizeiptr;
 typedef std::uint8_t GLubyte;
 typedef unsigned int GLuint;
+typedef struct __GLsync* GLsync;
+typedef std::uint64_t GLuint64;
 
 #define GL_ALWAYS 0x0207
+#define GL_ALREADY_SIGNALED 0x911A
+#define GL_CONDITION_SATISFIED 0x911C
+#define GL_MAP_READ_BIT 0x0001
+#define GL_PIXEL_PACK_BUFFER 0x88EB
+#define GL_STREAM_READ 0x88E1
+#define GL_SYNC_FLUSH_COMMANDS_BIT 0x00000001
+#define GL_TIMEOUT_EXPIRED 0x911B
+#define GL_SYNC_GPU_COMMANDS_COMPLETE 0x9117
 #define GL_ARRAY_BUFFER 0x8892
 #define GL_MAP_WRITE_BIT 0x0002
 #define GL_MAP_INVALIDATE_RANGE_BIT 0x0004
@@ -146,6 +156,9 @@ typedef unsigned int GLuint;
     X(void, glDepthFunc, (GLenum func)) \
     X(void, glDepthMask, (GLboolean flag)) \
     X(void, glDisable, (GLenum cap)) \
+    X(GLsync, glFenceSync, (GLenum condition, GLbitfield flags)) \
+    X(GLenum, glClientWaitSync, (GLsync sync, GLbitfield flags, GLuint64 timeout)) \
+    X(void, glDeleteSync, (GLsync sync)) \
     X(void, glDrawArrays, (GLenum mode, GLint first, GLsizei count)) \
     X(void, glEnable, (GLenum cap)) \
     X(void, glEnableVertexAttribArray, (GLuint index)) \
@@ -176,6 +189,7 @@ typedef unsigned int GLuint;
     X(void, glTexParameteri, (GLenum target, GLenum pname, GLint param)) \
     X(void, glUniform1f, (GLint location, GLfloat v0)) \
     X(void, glUniform1i, (GLint location, GLint v0)) \
+    X(void, glUniform2i, (GLint location, GLint v0, GLint v1)) \
     X(void, glUniform2ui, (GLint location, GLuint v0, GLuint v1)) \
     X(void, glUniform3fv, (GLint location, GLsizei count, const GLfloat *value)) \
     X(void, glUniform4f, (GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3)) \

@@ -16,6 +16,9 @@ bool init(const Config& config) {
     reset();
     g_graphics = renderer::init(config.window_width, config.window_height, config.screenshot_dir, config.max_screenshots);
     g_wgp_write = &wgp_write;
+    g_gp_sync = [] {
+        if (g_graphics) renderer::flush_copies();
+    };
     if (g_graphics) input::init(config.input_config);
     bench::start();
     return g_graphics;
@@ -23,6 +26,7 @@ bool init(const Config& config) {
 
 void shutdown() {
     g_wgp_write = nullptr;
+    g_gp_sync = nullptr;
     if (g_graphics) {
         input::shutdown();
         renderer::shutdown();

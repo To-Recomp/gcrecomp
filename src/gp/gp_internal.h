@@ -77,6 +77,8 @@ bool init(int window_w, int window_h, const char* screenshot_dir, int max_screen
 void shutdown();
 void draw(const DrawCall& call, const State& state);
 void copy_efb(const CopyRequest& request, const State& state);
+// The game synchronised with the GPU (draw-sync token, draw done): copies kept on the GPU are written to guest memory.
+void flush_copies();
 bool pump_events();
 }  // namespace renderer
 

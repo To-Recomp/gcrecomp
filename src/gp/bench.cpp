@@ -118,7 +118,7 @@ void report(const Sample& a, const Sample& b) {
     const double idle = double(b.idle_ns - a.idle_ns) * 1e-9;
     std::fprintf(stderr,
                  "[bench] t=%.1f fps=%.2f retrace=%.2f presented=%llu retraces=%llu dispatch=%s/s memops=%s/s draws=%llu verts=%llu "
-                 "texdec=%llu texdec_indexed=%llu textexels=%llu texhash=%llu texhash_bytes=%s efbmem=%llu efbmem_px=%s "
+                 "texdec=%llu texdec_indexed=%llu textexels=%llu texhash=%llu texhash_bytes=%s efbmem=%llu efbmem_px=%s efbgpu=%llu efbgpu_hits=%llu efbflush=%llu efbguard=%llu "
                  "parse_ms=%.0f draw_ms=%.0f readback_ms=%.0f swap_ms=%.0f cpu=%.0f%% idle=%.0f%% threads=%s\n",
                  b.t, double(b.presented - a.presented) / dt, double(b.retraces - a.retraces) / dt, (unsigned long long)b.presented,
                  (unsigned long long)b.retraces, human(double(b.dispatch - a.dispatch) / dt).c_str(),
@@ -130,6 +130,8 @@ void report(const Sample& a, const Sample& b) {
                  human(double(b.render.tex_validated_bytes - a.render.tex_validated_bytes)).c_str(),
                  (unsigned long long)(b.render.efb_copies_memory - a.render.efb_copies_memory),
                  human(double(b.render.efb_copy_pixels - a.render.efb_copy_pixels)).c_str(),
+                 (unsigned long long)(b.render.efb_gpu_copies - a.render.efb_gpu_copies), (unsigned long long)(b.render.efb_gpu_hits - a.render.efb_gpu_hits),
+                 (unsigned long long)(b.render.efb_flushes - a.render.efb_flushes), (unsigned long long)(b.render.efb_guard_hits - a.render.efb_guard_hits),
                  double(b.render.parse_ns - a.render.parse_ns) * 1e-6 / dt, double(b.render.draw_ns - a.render.draw_ns) * 1e-6 / dt,
                  double(b.render.readback_ns - a.render.readback_ns) * 1e-6 / dt, double(b.render.swap_ns - a.render.swap_ns) * 1e-6 / dt,
                  100.0 * cpu_total / dt,

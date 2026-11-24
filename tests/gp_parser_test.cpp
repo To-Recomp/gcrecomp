@@ -60,6 +60,7 @@ static std::vector<CopyRequest> g_copies;
 namespace gcrecomp::gp::renderer {
 bool init(int, int, const char*, int) { return true; }
 void shutdown() {}
+void flush_copies() {}
 void draw(const DrawCall& call, const State&) {
     g_draws.push_back({call.primitive, call.vertex_count,
                        std::vector<float>(call.vertices, call.vertices + size_t(call.vertex_count) * kVertexFloats)});
