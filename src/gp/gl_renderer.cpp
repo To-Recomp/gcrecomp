@@ -48,12 +48,17 @@ int g_shot_count = 0;
 GLuint g_fbo = 0, g_color = 0, g_depth = 0;
 GLuint g_vao = 0, g_vbo = 0, g_program = 0;
 GLuint g_white = 0;
+GLuint g_present_program = 0, g_present_vao = 0;  // the pass that presents an EFB copy through the vertical copy filter
+struct PresentLocations {
+    GLint rect = -1, misc = -1, weights = -1;
+} g_present_loc;
+constexpr int kEfbUnit = 7;  // texture unit the EFB's colour texture is bound to while that pass samples it
 bool g_ring_valid = false;  // the vertex buffer holds the ring (an oversized draw replaced it)
 bool g_efb_bound = false;  // GL_FRAMEBUFFER is the EFB framebuffer (draw() binds it lazily; EFB copies unbind it)
 uint64_t g_indirect_draws = 0;
 // How often the game used the features that are only visible on screen, reported at shutdown.
 struct FeatureUse {
-    uint64_t c14x2_textures = 0, mip_textures = 0, fog_draws = 0, const_alpha_draws = 0, logic_op_draws = 0, early_z_passes = 0, tev_compare_draws = 0;
+    uint64_t c14x2_textures = 0, mip_textures = 0, fog_draws = 0, const_alpha_draws = 0, logic_op_draws = 0, early_z_passes = 0, tev_compare_draws = 0, filtered_copies = 0;
 } g_use;
 
 const char* kVertexShader = R"(#version 330 core
@@ -259,6 +264,34 @@ void main() {
     o_src1 = vec4(vec3(result.a), result.a);
     if (u_const_alpha >= 0.0) result.a = u_const_alpha;
     o_color = result;
+}
+)";
+
+// Presents an EFB copy through the vertical copy filter (efb_copy.h): one full-screen triangle that samples the EFB's colour
+// texture three times, one EFB line apart, and weighs the samples. The bilinear stretch to the window is the plain blit's.
+const char* kPresentVertexShader = R"(#version 330 core
+void main() {
+    vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+)";
+
+const char* kPresentFragmentShader = R"(#version 330 core
+uniform sampler2D u_efb;
+uniform vec4 u_rect;     // the copied rectangle in EFB texels: x, y of its lowest line (GL rows), width, height
+uniform vec4 u_misc;     // window width and height; lines the filter may read above and below the rectangle (0 or 1)
+uniform vec4 u_weights;  // line above, line itself, line below, each over 64
+out vec4 o_color;
+void main() {
+    vec2 p = u_rect.xy + gl_FragCoord.xy / u_misc.xy * u_rect.zw;
+    vec2 inv = 1.0 / vec2(textureSize(u_efb, 0));
+    float x = clamp(p.x, u_rect.x + 0.5, u_rect.x + u_rect.z - 0.5);
+    float lo = u_rect.y + 0.5, hi = u_rect.y + u_rect.w - 0.5;
+    // GL rows run bottom to top: the line above on the screen is the next row up.
+    vec4 c = u_weights.y * texture(u_efb, vec2(x, clamp(p.y, lo, hi)) * inv);
+    c += u_weights.x * texture(u_efb, vec2(x, clamp(p.y + 1.0, lo, hi + u_misc.z)) * inv);
+    c += u_weights.z * texture(u_efb, vec2(x, clamp(p.y - 1.0, lo - u_misc.w, hi)) * inv);
+    o_color = vec4(c.rgb, 1.0);
 }
 )";
 
@@ -748,6 +781,7 @@ void apply_register_state(const State& s) {
 }
 
 void print_feature_use() {
+    if (g_use.filtered_copies) std::fprintf(stderr, "[GL] %llu EFB copies went through the vertical copy filter (GP_COPY_FILTER=off disables it)\n", (unsigned long long)g_use.filtered_copies);
     std::fprintf(stderr, "[GL] feature use: C14X2 textures %llu, mipmapped textures %llu, fog draws %llu, constant-alpha draws %llu, logic-op draws %llu, early-Z passes %llu, TEV compare-mode draws %llu\n",
                  (unsigned long long)g_use.c14x2_textures, (unsigned long long)g_use.mip_textures, (unsigned long long)g_use.fog_draws,
                  (unsigned long long)g_use.const_alpha_draws, (unsigned long long)g_use.logic_op_draws, (unsigned long long)g_use.early_z_passes, (unsigned long long)g_use.tev_compare_draws);
@@ -891,6 +925,11 @@ bool init(int window_w, int window_h, const char* screenshot_dir, int max_screen
     glGenTextures(1, &g_color);
     glBindTexture(GL_TEXTURE_2D, g_color);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kEfbWidth, kEfbHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    // The EFB colour texture is also sampled, by the pass that presents a filtered copy (copy_filter in present).
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glGenRenderbuffers(1, &g_depth);
     glBindRenderbuffer(GL_RENDERBUFFER, g_depth);
     glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, kEfbWidth, kEfbHeight);
@@ -935,6 +974,32 @@ bool init(int window_w, int window_h, const char* screenshot_dir, int max_screen
         char name[16];
         std::snprintf(name, sizeof(name), "u_tex%d", m);
         glUniform1i(glGetUniformLocation(g_program, name), m);
+    }
+
+    // The pass that presents an EFB copy through the vertical filter (a plain blit when the filter is the identity).
+    {
+        const GLuint pvs = compile(GL_VERTEX_SHADER, kPresentVertexShader);
+        const GLuint pfs = compile(GL_FRAGMENT_SHADER, kPresentFragmentShader);
+        GLint ok = 0;
+        if (pvs && pfs) {
+            g_present_program = glCreateProgram();
+            glAttachShader(g_present_program, pvs);
+            glAttachShader(g_present_program, pfs);
+            glLinkProgram(g_present_program);
+            glGetProgramiv(g_present_program, GL_LINK_STATUS, &ok);
+        }
+        if (!ok) {
+            std::fprintf(stderr, "[GL] the copy filter pass did not build: presented frames are not filtered\n");
+            g_present_program = 0;
+        } else {
+            g_present_loc.rect = glGetUniformLocation(g_present_program, "u_rect");
+            g_present_loc.misc = glGetUniformLocation(g_present_program, "u_misc");
+            g_present_loc.weights = glGetUniformLocation(g_present_program, "u_weights");
+            glUseProgram(g_present_program);
+            glUniform1i(glGetUniformLocation(g_present_program, "u_efb"), kEfbUnit);
+            glUseProgram(g_program);
+        }
+        glGenVertexArrays(1, &g_present_vao);
     }
 
     glGenVertexArrays(1, &g_vao);
@@ -1104,6 +1169,43 @@ void draw(const DrawCall& call, const State& s) {
     }
 }
 
+// The vertical copy filter (BP 0x53 / 0x54, efb_copy.h) of a copy; the identity when GP_COPY_FILTER=off or for depth.
+static CopyFilter copy_filter_of(const State& s, bool depth) {
+    static const bool off = [] {
+        const char* v = std::getenv("GP_COPY_FILTER");
+        return v && (!std::strcmp(v, "off") || !std::strcmp(v, "0"));
+    }();
+    return (depth || off) ? CopyFilter() : make_copy_filter(s.bp[0x53], s.bp[0x54]);
+}
+
+// Presents the copied EFB region through the copy filter: each window pixel shows
+//   (above * line(y-1) + centre * line(y) + below * line(y+1)) / 64
+// of the EFB lines under it. The lines beyond the rectangle's first and last repeat those where the clamp bits (command bits 0
+// and 1) say so, and are read from the EFB otherwise (copy_filter_margins).
+static void present_filtered(const CopyRequest& r, const State& s, const CopyFilter& f) {
+    EfbCopyParams p;
+    p.y = r.y;
+    p.h = r.h;
+    p.clamp_top = s.bp[0x52] & 1;
+    p.clamp_bottom = (s.bp[0x52] >> 1) & 1;
+    int above = 0, below = 0;
+    copy_filter_margins(p, kEfbHeight, &above, &below);
+    glUseProgram(g_present_program);
+    glBindVertexArray(g_present_vao);
+    bind_unit_texture(kEfbUnit, g_color);
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_COLOR_LOGIC_OP);
+    glUniform4f(g_present_loc.rect, float(r.x), float(kEfbHeight - (r.y + r.h)), float(r.w), float(r.h));
+    glUniform4f(g_present_loc.misc, float(g_window_w), float(g_window_h), float(above), float(below));
+    glUniform4f(g_present_loc.weights, float(f.above) / 64.0f, float(f.centre) / 64.0f, float(f.below) / 64.0f, 0.0f);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    bind_unit_texture(kEfbUnit, g_white);  // the draws' sampler for this unit must not read the texture they render to
+    glBindVertexArray(g_vao);
+    glUseProgram(g_program);
+}
+
 // Copy a region of the EFB to main memory in the console's tiled layout (BP 0x52 with the XFB bit
 // clear). Reads back from the GPU. The texture cache keys on a hash of the guest bytes, so entries
 // overlapping the destination are re-decoded on their next use without explicit invalidation.
@@ -1120,9 +1222,18 @@ static void copy_efb_to_memory(const State& s, uint32_t copy_cmd) {
         std::fprintf(stderr, "[GL] EFB copy to 0x%06X (+%zu) is outside RAM, ignored\n", addr, efb_copy_extent(p));
         return;
     }
+    // A filtered copy also reads the line above and below the rectangle (where the clamp bits and the EFB's edge allow), so
+    // the readback covers `rows` lines and the rectangle's own are the middle ones.
+    const CopyFilter filter = copy_filter_of(s, p.depth);
+    int above = 0, below = 0;
+    if (!filter.identity()) {
+        copy_filter_margins(p, kEfbHeight, &above, &below);
+        ++g_use.filtered_copies;
+    }
+    const int rows = p.h + above + below;
     glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    const int gl_y = kEfbHeight - (p.y + p.h);
+    const int gl_y = kEfbHeight - (p.y + p.h + below);
     // Read-back buffers kept between copies (a frame makes several): no allocation and no zero fill per copy.
     static std::vector<uint8_t> rgba;
     static std::vector<uint32_t> depth;
@@ -1134,17 +1245,20 @@ static void copy_efb_to_memory(const State& s, uint32_t copy_cmd) {
         }
         for (uint32_t& d : depth) d >>= 8;
     } else {
-        rgba.resize(size_t(p.w) * p.h * 4);
+        rgba.resize(size_t(p.w) * rows * 4);
         bench::ScopedNs timer(g_render_stats.readback_ns);
-        glReadPixels(p.x, gl_y, p.w, p.h, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        glReadPixels(p.x, gl_y, p.w, rows, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
     }
     // GL rows run bottom to top.
     auto flip = [&](auto& v, size_t row_elems) {
-        for (int a = 0, b = p.h - 1; a < b; ++a, --b)
+        for (int a = 0, b = rows - 1; a < b; ++a, --b)
             std::swap_ranges(v.begin() + a * row_elems, v.begin() + (a + 1) * row_elems, v.begin() + b * row_elems);
     };
     if (p.depth) flip(depth, size_t(p.w)); else flip(rgba, size_t(p.w) * 4);
-    encode_efb_copy(p, p.depth ? nullptr : rgba.data(), p.depth ? depth.data() : nullptr, g_mem.translate(addr));
+    uint8_t* image = rgba.data() + size_t(above) * p.w * 4;
+    if (!filter.identity())
+        apply_copy_filter(filter, image, p.w, p.h, above ? rgba.data() : nullptr, below ? image + size_t(p.h) * p.w * 4 : nullptr);
+    encode_efb_copy(p, p.depth ? nullptr : image, p.depth ? depth.data() : nullptr, g_mem.translate(addr));
     g_mem.mark_written(addr | Memory::MAIN_RAM_BASE, uint32_t(efb_copy_extent(p)));  // the cached textures made from this memory are stale
 }
 
@@ -1174,7 +1288,13 @@ void copy_efb(const CopyRequest& r, const State& s) {
         glClearColor(0, 0, 0, 1);
         glClear(GL_COLOR_BUFFER_BIT);
         const int sy0 = kEfbHeight - (r.y + r.h), sy1 = kEfbHeight - r.y;
-        glBlitFramebuffer(r.x, sy0, r.x + r.w, sy1, 0, 0, g_window_w, g_window_h, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        const CopyFilter filter = copy_filter_of(s, (s.bp[0x43] & 7) == 3);
+        if (filter.identity() || !g_present_program) {
+            glBlitFramebuffer(r.x, sy0, r.x + r.w, sy1, 0, 0, g_window_w, g_window_h, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        } else {
+            ++g_use.filtered_copies;
+            present_filtered(r, s, filter);
+        }
         write_screenshot();
         if (r.diag) {
             diag::Image& win = diag::g_bundle.window;

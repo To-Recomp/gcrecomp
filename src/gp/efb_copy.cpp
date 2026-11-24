@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <vector>
 
 namespace gcrecomp::gp {
 
@@ -90,7 +91,42 @@ EfbCopyParams make_efb_copy_params(uint32_t copy_cmd, uint32_t src_xy, uint32_t 
     p.y_scale_reg = y_scale_reg & 0x1FF;
     p.depth = depth;
     p.stride = (stride_reg & 0x3FF) * 32;
+    p.clamp_top = copy_cmd & 1;
+    p.clamp_bottom = (copy_cmd >> 1) & 1;
     return p;
+}
+
+CopyFilter make_copy_filter(uint32_t bp53, uint32_t bp54) {
+    CopyFilter f;
+    if ((bp53 & 0xFFFFFF) == 0 && (bp54 & 0xFFFFFF) == 0) return f;  // never programmed
+    const int c0 = int(bp53 & 63), c1 = int((bp53 >> 6) & 63), c2 = int((bp53 >> 12) & 63), c3 = int((bp53 >> 18) & 63);
+    const int c4 = int(bp54 & 63), c5 = int((bp54 >> 6) & 63), c6 = int((bp54 >> 12) & 63);
+    f.above = c0 + c1;
+    f.centre = c2 + c3 + c4;
+    f.below = c5 + c6;
+    return f;
+}
+
+void copy_filter_margins(const EfbCopyParams& p, int efb_height, int* above, int* below) {
+    *above = (!p.clamp_top && p.y > 0) ? 1 : 0;
+    *below = (!p.clamp_bottom && p.y + p.h < efb_height) ? 1 : 0;
+}
+
+void apply_copy_filter(const CopyFilter& f, uint8_t* rgba, int w, int h, const uint8_t* above, const uint8_t* below) {
+    if (f.identity() || w <= 0 || h <= 0) return;
+    const size_t row = size_t(w) * 4;
+    std::vector<uint8_t> prev(row);  // the unfiltered line above the current one
+    if (above) std::memcpy(prev.data(), above, row);
+    else std::memcpy(prev.data(), rgba, row);
+    for (int y = 0; y < h; ++y) {
+        uint8_t* cur = rgba + size_t(y) * row;
+        const uint8_t* next = y + 1 < h ? cur + row : (below ? below : cur);
+        for (size_t i = 0; i < row; ++i) {
+            const int v = (f.above * prev[i] + f.centre * cur[i] + f.below * next[i] + 32) >> 6;
+            prev[i] = cur[i];  // the unfiltered value is the next row's "above"
+            cur[i] = uint8_t(v > 255 ? 255 : v);
+        }
+    }
 }
 
 void efb_copy_output_size(const EfbCopyParams& p, int* out_w, int* out_h) {

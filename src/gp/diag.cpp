@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <system_error>
 
+#include "efb_copy.h"
 #include "gp_decode.h"
 
 namespace gcrecomp::gp::diag {
@@ -131,25 +132,6 @@ std::string bundle_dir_name(int n, int64_t unix_seconds, const std::string& name
 
 // ---- Features ------------------------------------------------------------------------------------
 
-namespace {
-
-// Vertical copy filter taps c0..c6 (BP 0x53: c0..c3 in 6-bit fields from bit 0; BP 0x54: c4..c6).
-void filter_taps(uint32_t bp53, uint32_t bp54, int c[7]) {
-    c[0] = int(bp53 & 63);
-    c[1] = int((bp53 >> 6) & 63);
-    c[2] = int((bp53 >> 12) & 63);
-    c[3] = int((bp53 >> 18) & 63);
-    c[4] = int(bp54 & 63);
-    c[5] = int((bp54 >> 6) & 63);
-    c[6] = int((bp54 >> 12) & 63);
-}
-
-bool filter_is_identity(const int c[7]) {
-    return c[0] + c[1] == 0 && c[5] + c[6] == 0 && c[2] + c[3] + c[4] == 64;
-}
-
-}  // namespace
-
 void note_draw_features(Bundle& b, const uint32_t* bp, const uint32_t* xf) {
     if (indirect_tev_stages(bp)) b.feature("indirect texturing", false);
     const FogParams fog = decode_fog(bp);
@@ -190,9 +172,7 @@ void note_draw_features(Bundle& b, const uint32_t* bp, const uint32_t* xf) {
 }
 
 void note_copy_features(Bundle& b, uint32_t cmd, uint32_t bp53, uint32_t bp54, bool depth) {
-    int c[7];
-    filter_taps(bp53, bp54, c);
-    if (!depth && !filter_is_identity(c)) b.feature("EFB copy vertical filter", false);
+    if (!depth && !make_copy_filter(bp53, bp54).identity()) b.feature("EFB copy vertical filter", true);
     if ((cmd >> 7) & 3) b.feature("EFB copy gamma", false);
     if ((cmd >> 2) & 1) b.feature("EFB copy YUV", false);
     if ((cmd >> 12) & 3) b.feature("EFB copy frame-to-field", false);

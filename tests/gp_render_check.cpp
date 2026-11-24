@@ -3,10 +3,15 @@
 // 3.3 context but no window system: run it as
 //   SDL_VIDEO_DRIVER=offscreen ./gp_render_check
 // (it is not part of ctest because CI machines may have no EGL). Covers the blend-state features that
-// are only visible on screen: logic ops, constant alpha, fog.
+// are only visible on screen: logic ops, constant alpha, fog, and the vertical copy filter of a presented frame (the frames
+// are written to a temporary directory and read back from there: the window is swapped by the copy).
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <vector>
 
 #include "gl_loader.h"
 #include "gp_internal.h"
@@ -54,8 +59,36 @@ static void expect(const char* what, int r, int g, int b, int a) {
     if (!ok) ++g_failures;
 }
 
+// The window as the renderer presented it last: the newest frame_NNNN.ppm of `dir`. Returns the pixel (x, y), y from the top.
+static bool presented_pixel(const std::filesystem::path& dir, int x, int y, int rgb[3]) {
+    std::filesystem::path newest;
+    for (const auto& e : std::filesystem::directory_iterator(dir))
+        if (e.path().extension() == ".ppm" && e.path() > newest) newest = e.path();
+    std::ifstream f(newest, std::ios::binary);
+    std::string magic;
+    int w = 0, h = 0, maxv = 0;
+    f >> magic >> w >> h >> maxv;
+    f.get();
+    if (!f || magic != "P6" || x >= w || y >= h) return false;
+    std::vector<unsigned char> px(size_t(w) * h * 3);
+    f.read(reinterpret_cast<char*>(px.data()), std::streamsize(px.size()));
+    for (int c = 0; c < 3; ++c) rgb[c] = px[(size_t(y) * w + x) * 3 + c];
+    return bool(f);
+}
+
+static void expect_presented(const std::filesystem::path& dir, const char* what, int y, int r) {
+    int p[3] = {};
+    const bool ok = presented_pixel(dir, 320, y, p) && std::abs(p[0] - r) <= 2 && std::abs(p[1] - r) <= 2 && std::abs(p[2] - r) <= 2;
+    std::printf("%s %-34s got %3d %3d %3d, expected %3d\n", ok ? "ok  " : "FAIL", what, p[0], p[1], p[2], r);
+    if (!ok) ++g_failures;
+}
+
 int main() {
-    if (!renderer::init(640, 528, nullptr, 0)) {
+    const std::filesystem::path shots = std::filesystem::temp_directory_path() / "gp_render_check_frames";
+    std::filesystem::remove_all(shots);
+    std::filesystem::create_directories(shots);
+    const std::string shots_dir = shots.string();  // the renderer keeps the pointer
+    if (!renderer::init(640, 528, shots_dir.c_str(), 0)) {
         std::fprintf(stderr, "cannot create a GL context (try SDL_VIDEO_DRIVER=offscreen)\n");
         return 2;
     }
@@ -187,6 +220,55 @@ int main() {
         else expect("late Z: behind a rejected pixel", 0, 255, 0, 255);
     }
 
+    // Vertical copy filter on a presented frame. The upper half of the viewport (EFB lines 48..287) is white over black: the
+    // deflicker taps (8 8 10 12 10 8 8 = 16/32/16 of 64) soften the line on each side of an edge and leave the rest alone;
+    // taps that were never written, or the identity pattern (0 0 21 22 21 0 0), change nothing.
+    s.bp[0x41] = kUpdate | kCopy;
+    s.bp[0x40] = 0;
+    s.bp[0x43] = 0;
+    s.bp[0xF3] = (7 << 16) | (7 << 19);
+    auto present = [&](uint32_t bp53, uint32_t bp54, uint32_t cmd) {
+        clear();
+        const float upper[3][4] = {{-1, 0, 0, 1}, {3, 0, 0, 1}, {-1, 4, 0, 1}};
+        for (int i = 0; i < 3; ++i) std::memcpy(&verts[i * kVertexFloats], upper[i], sizeof(upper[i]));
+        set_color(1, 1, 1, 1);
+        draw();
+        for (int i = 0; i < 3; ++i) std::memcpy(&verts[i * kVertexFloats], pos[i], sizeof(pos[i]));
+        s.bp[0x53] = bp53;
+        s.bp[0x54] = bp54;
+        s.bp[0x52] = cmd;
+        CopyRequest r{};
+        r.to_xfb = true;
+        r.w = 640;
+        r.h = 528;
+        renderer::copy_efb(r, s);
+    };
+    const uint32_t id53 = (21u << 12) | (22u << 18), id54 = 21u;
+    const uint32_t df53 = 8u | (8u << 6) | (10u << 12) | (12u << 18), df54 = 10u | (8u << 6) | (8u << 12);
+    present(df53, df54, 3);  // clamp top and bottom, as the game does
+    expect_presented(shots, "deflicker: white line at the edge", 287, 191);
+    expect_presented(shots, "deflicker: black line at the edge", 288, 64);
+    expect_presented(shots, "deflicker: inside the white", 200, 255);
+    expect_presented(shots, "deflicker: inside the black", 400, 0);
+    expect_presented(shots, "deflicker: black above the white", 47, 64);
+    expect_presented(shots, "deflicker: white below the top edge", 48, 191);
+    // Asymmetric weights tell the line above (smaller EFB y, the top of the screen) from the line below: 48/16/0 of 64 shows
+    // the white above a black line as 3/4 white and nothing of the white below a white line.
+    present(24u | (24u << 6) | (5u << 12) | (6u << 18), 5u, 3);
+    expect_presented(shots, "above-weighted: black under white", 288, 191);
+    expect_presented(shots, "above-weighted: white above black", 287, 255);
+    expect_presented(shots, "above-weighted: black further down", 289, 0);
+    present(id53, id54, 3);
+    expect_presented(shots, "identity taps: edge stays sharp", 287, 255);
+    expect_presented(shots, "identity taps: edge stays sharp", 288, 0);
+    present(0, 0, 3);
+    expect_presented(shots, "taps never written: sharp", 287, 255);
+    present(32u << 12, 0, 3);  // a single tap of 32/64 on the line itself: the whole copy fades to half
+    expect_presented(shots, "fade taps: white halves", 200, 128);
+    expect_presented(shots, "fade taps: black stays", 400, 0);
+
     renderer::shutdown();
+    std::error_code ec;
+    if (!std::getenv("GP_RENDER_CHECK_KEEP")) std::filesystem::remove_all(shots, ec);
     return g_failures ? 1 : 0;
 }
