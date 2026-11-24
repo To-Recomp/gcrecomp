@@ -8,6 +8,7 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -49,6 +50,10 @@ int g_shot_count = 0;
 
 GLuint g_fbo = 0, g_color = 0, g_depth = 0;
 GLuint g_vao = 0, g_vbo = 0, g_program = 0;
+// The same shader with early fragment tests (GL_ARB_shader_image_load_store): the depth test AND the depth write happen before the shader, so a
+// fragment it discards has written its depth: GX's "Z compare before texturing" with an alpha test, in one pass (0: not available, the draw is
+// replayed depth-only instead, see flush_batch). g_active is the program in use.
+GLuint g_program_early = 0, g_active = 0;
 GLuint g_white = 0;
 GLuint g_present_program = 0, g_present_vao = 0;  // the pass that presents an EFB copy through the vertical copy filter
 struct PresentLocations {
@@ -395,8 +400,11 @@ GLuint g_bound[8] = {~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
 int g_active_unit = -1;
 
 // Binds `id` to `unit` for sampling; the active unit is left alone when the texture is already bound there.
+void flush_batch();  // draws the batched triangles (see "Draw batching" below); before any change of GL state they depend on
+
 void bind_unit_texture(int unit, GLuint id) {
     if (g_bound[unit] == id) return;
+    flush_batch();
     if (g_active_unit != unit) {
         glActiveTexture(GL_TEXTURE0 + unit);
         g_active_unit = unit;
@@ -412,6 +420,7 @@ void edit_unit_texture(int unit, GLuint id) {
         g_active_unit = unit;
     }
     if (g_bound[unit] != id) {
+        flush_batch();
         glBindTexture(GL_TEXTURE_2D, id);
         g_bound[unit] = id;
     }
@@ -574,6 +583,7 @@ SamplerParams wanted_sampler(uint32_t mode0, uint32_t mode1, uint32_t levels) {
 
 void apply_sampler(int map, GLuint id, SamplerParams& cache, bool& valid, const SamplerParams& want) {
     if (valid && cache == want) return;
+    flush_batch();
     edit_unit_texture(map, id);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, want.wrap_s);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, want.wrap_t);
@@ -660,6 +670,7 @@ GLuint texture_for_map(const State& s, int map) {
         if (trace_tex)
             std::fprintf(stderr, "[TEX] frame %llu decode map=%d addr=%06X fmt=%X %ux%u levels=%u %s data=%08X palette=%08X\n", (unsigned long long)g_frames, map, addr, fmt, w, h,
                          levels, t.id == 0 ? "new" : t.decoded_data != t.data_hash ? "data changed" : "palette changed", unsigned(t.data_hash), unsigned(t.tlut_hash));
+        flush_batch();  // queued draws sample the old contents
         t.decoded_data = t.data_hash;
         t.decoded_tlut = t.tlut_hash;
         const std::vector<uint8_t> rgba = decode_level(0);
@@ -734,7 +745,8 @@ GLenum compare_func(uint32_t f) {
 struct UniformLocations {
     GLint nstages = -1, stage = -1, swap = -1, reg = -1, konst = -1, alpha_cmp = -1, fog_f = -1, fog_i = -1, fog_color = -1,
           const_alpha = -1;
-} g_loc;
+} g_loc;  // the locations in the program in use (g_active)
+UniformLocations g_locs[2];  // [0] g_program, [1] g_program_early
 
 // A uniform's last uploaded words: the upload is skipped when the new value is bit-identical.
 template <size_t N>
@@ -803,7 +815,25 @@ void apply_state(const State& s) {
     }
 }
 
+// The draw's alpha-tested pixels that pass the depth test write depth even where the test rejects them, and this build has no early
+// fragment tests: draw the draw again, depth only (flush_batch, draw_direct).
+bool needs_replay(const State& s) { return !g_program_early && early_z_writes_rejected_pixels(s.bp); }
+
 void apply_register_state(const State& s) {
+    // The program: with early fragment tests for the draws that need them (see g_program_early).
+    {
+        const bool early = g_program_early && early_z_writes_rejected_pixels(s.bp);
+        const GLuint want = early ? g_program_early : g_program;
+        if (want != g_active) {
+            flush_batch();  // queued draws belong to the other program
+            g_active = want;
+            glUseProgram(want);
+            g_loc = g_locs[early ? 1 : 0];
+            // The new program holds none of the uniform values sent to the other one.
+            g_sh.const_alpha.valid = g_sh.nstages.valid = g_sh.stage.valid = g_sh.swap.valid = g_sh.reg.valid = g_sh.konst.valid = false;
+            g_sh.alpha_cmp.valid = g_sh.fog_f.valid = g_sh.fog_i.valid = g_sh.fog_color.valid = false;
+        }
+    }
     // Viewport and scissor, in EFB coordinates (origin top-left) converted to GL (origin bottom-left).
     const float wd = s.xf_float(0x101A), ht = s.xf_float(0x101B), xo = s.xf_float(0x101D), yo = s.xf_float(0x101E);
     const float x_off = float((s.bp[0x59] & 0x3FF) * 2), y_off = float(((s.bp[0x59] >> 10) & 0x3FF) * 2);
@@ -1163,22 +1193,51 @@ bool init(int window_w, int window_h, const char* screenshot_dir, int max_screen
         std::fprintf(stderr, "[GL] link failed:\n%s\n", log);
         return false;
     }
-    glUseProgram(g_program);  // the only program: apply_state does not select it again
-    g_loc.nstages = glGetUniformLocation(g_program, "u_nstages");
-    g_loc.stage = glGetUniformLocation(g_program, "u_stage");
-    g_loc.swap = glGetUniformLocation(g_program, "u_swap");
-    g_loc.reg = glGetUniformLocation(g_program, "u_reg");
-    g_loc.konst = glGetUniformLocation(g_program, "u_konst");
-    g_loc.alpha_cmp = glGetUniformLocation(g_program, "u_alpha_cmp");
-    g_loc.fog_f = glGetUniformLocation(g_program, "u_fog_f");
-    g_loc.fog_i = glGetUniformLocation(g_program, "u_fog_i");
-    g_loc.fog_color = glGetUniformLocation(g_program, "u_fog_color");
-    g_loc.const_alpha = glGetUniformLocation(g_program, "u_const_alpha");
-    for (int m = 0; m < 8; ++m) {
-        char name[16];
-        std::snprintf(name, sizeof(name), "u_tex%d", m);
-        glUniform1i(glGetUniformLocation(g_program, name), m);
+    auto locate = [](GLuint prog, UniformLocations& l) {
+        glUseProgram(prog);
+        l.nstages = glGetUniformLocation(prog, "u_nstages");
+        l.stage = glGetUniformLocation(prog, "u_stage");
+        l.swap = glGetUniformLocation(prog, "u_swap");
+        l.reg = glGetUniformLocation(prog, "u_reg");
+        l.konst = glGetUniformLocation(prog, "u_konst");
+        l.alpha_cmp = glGetUniformLocation(prog, "u_alpha_cmp");
+        l.fog_f = glGetUniformLocation(prog, "u_fog_f");
+        l.fog_i = glGetUniformLocation(prog, "u_fog_i");
+        l.fog_color = glGetUniformLocation(prog, "u_fog_color");
+        l.const_alpha = glGetUniformLocation(prog, "u_const_alpha");
+        for (int m = 0; m < 8; ++m) {
+            char name[16];
+            std::snprintf(name, sizeof(name), "u_tex%d", m);
+            glUniform1i(glGetUniformLocation(prog, name), m);
+        }
+    };
+    locate(g_program, g_locs[0]);
+    // The early-fragment-test variant. GP_EARLY_TESTS=0 leaves it out (the depth replay is used then).
+    const char* early_env = std::getenv("GP_EARLY_TESTS");
+    if (!early_env || std::atoi(early_env) != 0) {
+        std::string src = kFragmentShader;
+        const size_t eol = src.find('\n');
+        src.insert(eol + 1, "#extension GL_ARB_shader_image_load_store : require\nlayout(early_fragment_tests) in;\n");
+        // A compile failure here only means the extension is missing: the log is not an error.
+        const GLuint efs = compile(GL_FRAGMENT_SHADER, src.c_str());
+        GLuint prog = efs ? glCreateProgram() : 0;
+        GLint ok = 0;
+        if (prog) {
+            glAttachShader(prog, vs);
+            glAttachShader(prog, efs);
+            glLinkProgram(prog);
+            glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+        }
+        if (ok) {
+            g_program_early = prog;
+            locate(prog, g_locs[1]);
+        } else {
+            std::fprintf(stderr, "[GL] early fragment tests are not available: alpha-tested draws that write depth are drawn twice\n");
+        }
     }
+    g_active = g_program;
+    g_loc = g_locs[0];
+    glUseProgram(g_active);
 
     // The pass that presents an EFB copy through the vertical filter (a plain blit when the filter is the identity).
     {
@@ -1201,7 +1260,7 @@ bool init(int window_w, int window_h, const char* screenshot_dir, int max_screen
             g_present_loc.weights = glGetUniformLocation(g_present_program, "u_weights");
             glUseProgram(g_present_program);
             glUniform1i(glGetUniformLocation(g_present_program, "u_efb"), kEfbUnit);
-            glUseProgram(g_program);
+            glUseProgram(g_active);
         }
         glGenVertexArrays(1, &g_present_vao);
     }
@@ -1227,7 +1286,7 @@ bool init(int window_w, int window_h, const char* screenshot_dir, int max_screen
             g_copy_mode_loc = glGetUniformLocation(g_copy_program, "u_mode");
             glUseProgram(g_copy_program);
             glUniform1i(glGetUniformLocation(g_copy_program, "u_efb"), kEfbUnit);
-            glUseProgram(g_program);
+            glUseProgram(g_active);
             glGenFramebuffers(1, &g_copy_fbo);
         }
     }
@@ -1236,6 +1295,9 @@ bool init(int window_w, int window_h, const char* screenshot_dir, int max_screen
     glGenBuffers(1, &g_vbo);
     glBindVertexArray(g_vao);
     glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
+    GLuint ibo = 0;
+    glGenBuffers(1, &ibo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);  // part of the VAO: the index list of a batch
     const GLsizei stride = kVertexFloats * sizeof(float);
     glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, stride, (void*)0);
     glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, (void*)(4 * sizeof(float)));
@@ -1261,6 +1323,7 @@ void flush_copies() {
 }
 
 void shutdown() {
+    flush_batch();
     flush_all_copies();
     g_mem.read_guard_hook = nullptr;
     g_mem.guard_count = 0;
@@ -1272,54 +1335,157 @@ void shutdown() {
     SDL_Quit();
 }
 
-void draw(const DrawCall& call, const State& s) {
-    // GP_SKIP_DRAW=1: the draws are parsed and decoded but not given to GL (isolates the cost of the renderer and the GPU).
-    static const bool skip_draw = std::getenv("GP_SKIP_DRAW") != nullptr;
-    if (skip_draw) return;
-    bench::ScopedNs timer(g_render_stats.draw_ns);
-    static uint64_t calls = 0;
-    ++calls;
-    static const bool gp_trace = std::getenv("GP_TRACE") != nullptr;
-    if ((calls == 1 || calls == 5000 || calls == 30000 || calls == 100000) && gp_trace) {
-        std::fprintf(stderr, "[GL] ---- draw #%llu\n", (unsigned long long)calls);
-        const int nst = int(((s.bp[0x00] >> 10) & 0xF) + 1);
-        std::fprintf(stderr, "[GL] draw prim=%u n=%u genmode=%06X ntev=%d zmode=%02X blend=%04X acmp=%06X\n", unsigned(call.primitive),
-                     call.vertex_count, s.bp[0], nst, s.bp[0x40], s.bp[0x41], s.bp[0xF3]);
-        std::fprintf(stderr, "[GL]   viewport wd=%g ht=%g xo=%g yo=%g zr=%g far=%g proj=%g %g %g %g %g %g ortho=%u\n",
-                     s.xf_float(0x101A), s.xf_float(0x101B), s.xf_float(0x101D), s.xf_float(0x101E), s.xf_float(0x101C),
-                     s.xf_float(0x101F), s.xf_float(0x1020), s.xf_float(0x1021), s.xf_float(0x1022), s.xf_float(0x1023),
-                     s.xf_float(0x1024), s.xf_float(0x1025), s.xf[0x1026]);
-        for (int i = 0; i < nst && i < 4; ++i)
-            std::fprintf(stderr, "[GL]   stage %d: color=%06X alpha=%06X tref=%06X ksel=%06X\n", i, s.bp[0xC0 + 2 * i], s.bp[0xC1 + 2 * i],
-                         s.bp[0x28 + i / 2], s.bp[0xF6 + i / 2]);
-        for (uint32_t v = 0; v < call.vertex_count && v < 4; ++v) {
-            const float* f = call.vertices + size_t(v) * kVertexFloats;
-            std::fprintf(stderr, "[GL]   v%u clip=(%g %g %g %g) c0=(%g %g %g %g) uv0=(%g %g %g)\n", v, f[0], f[1], f[2], f[3], f[4], f[5],
-                         f[6], f[7], f[12], f[13], f[14]);
-        }
-        std::fprintf(stderr, "[GL]   tex0 img0=%06X img3=%06X mode0=%06X\n", s.bp[0x88], s.bp[0x94], s.bp[0x80]);
-    }
-    if (const uint32_t ind = indirect_tev_stages(s.bp)) {
-        // Indirect texturing is not implemented: the draw is rendered as if the stages were direct.
-        // Say which games need it, once per distinct configuration.
-        ++g_indirect_draws;
-        static uint32_t seen[8];
-        static int nseen = 0;
-        const uint32_t sig = ind ^ (((s.bp[0x00] >> 16) & 7) << 16);
-        bool known = false;
-        for (int i = 0; i < nseen; ++i) known |= seen[i] == sig;
-        if (!known && nseen < 8) {
-            seen[nseen++] = sig;
-            std::fprintf(stderr, "[GL] indirect texturing used (draw #%llu): %u indirect stage(s), TEV stages 0x%04X; not implemented, drawn as direct\n",
-                         (unsigned long long)calls, (s.bp[0x00] >> 16) & 7, ind);
-        }
-    }
-    if (!g_efb_bound) {
-        glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
-        g_efb_bound = true;
-    }
-    apply_state(s);
+namespace {
 
+// ---- Draw batching --------------------------------------------------------------------------------------------------
+// The vertices are transformed on the CPU, so consecutive draws that share all GL state (State::gen unchanged, the same
+// textures bound: nothing below is called in between that changes GL state without flush_batch()) can be one GL draw: their
+// vertices are collected and drawn through an index list. A strip or fan becomes the triangles GL would make of it, a quad
+// two triangles (0 1 2) (0 2 3). Nothing here reorders anything: the triangles are drawn in the order they came.
+struct Batch {
+    bool open = false;
+    bool early_z = false;  // each draw needs the depth replay (below): the group must be pixel-disjoint
+    uint32_t gen = 0;
+    std::vector<std::array<float, 4>> boxes;  // clip-space boxes of the draws of an early-Z group
+    std::vector<float> verts;
+    std::vector<uint32_t> idx;
+} g_batch;
+size_t g_ring_used = 0;
+bool g_in_draw = false;
+
+void flush_batch() {
+    if (!g_batch.open) return;
+    g_batch.open = false;
+    if (g_batch.idx.empty()) {
+        g_batch.verts.clear();
+        return;
+    }
+    static uint64_t nested_ns = 0;  // renderer::draw's own timer already counts a flush it makes
+    bench::ScopedNs timer(g_in_draw ? nested_ns : g_render_stats.draw_ns);
+    constexpr size_t kVertexBytes = kVertexFloats * sizeof(float);
+    constexpr size_t kRingBytes = (16u << 20) / kVertexBytes * kVertexBytes;
+    const size_t bytes = g_batch.verts.size() * sizeof(float);
+    GLint first = 0;
+    if (bytes > kRingBytes) {
+        glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(bytes), g_batch.verts.data(), GL_STREAM_DRAW);
+        g_ring_valid = false;
+    } else {
+        if (!g_ring_valid || g_ring_used + bytes > kRingBytes) {
+            glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(kRingBytes), nullptr, GL_STREAM_DRAW);
+            g_ring_valid = true;
+            g_ring_used = 0;
+        }
+        // Unsynchronized: the range written is never one a queued draw still reads (the ring only moves forward).
+        void* dst = glMapBufferRange(GL_ARRAY_BUFFER, GLsizeiptr(g_ring_used), GLsizeiptr(bytes),
+                                     GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+        if (dst) {
+            std::memcpy(dst, g_batch.verts.data(), bytes);
+            glUnmapBuffer(GL_ARRAY_BUFFER);
+        } else {
+            glBufferSubData(GL_ARRAY_BUFFER, GLsizeiptr(g_ring_used), GLsizeiptr(bytes), g_batch.verts.data());
+        }
+        first = GLint(g_ring_used / kVertexBytes);
+        g_ring_used += bytes;
+    }
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, GLsizeiptr(g_batch.idx.size() * sizeof(uint32_t)), g_batch.idx.data(), GL_STREAM_DRAW);
+    glDrawElementsBaseVertex(GL_TRIANGLES, GLsizei(g_batch.idx.size()), GL_UNSIGNED_INT, nullptr, first);
+    ++g_render_stats.gl_draws;
+    if (g_batch.early_z) {
+        // Z compare before texturing: pixels the alpha test rejected still update depth. Replay the group without colour and
+        // without the alpha test; pixels that passed already wrote their depth and fail the depth test against themselves, the
+        // rejected ones write it now. The draws of the group touch no common pixel (batch_add), so replaying them together
+        // is replaying each after its own draw. The colour mask and the alpha test uniform are put back.
+        ++g_use.early_z_passes;
+        const int mask = g_sh.color_mask;
+        const uint32_t cmp0 = g_sh.alpha_cmp.w[0], cmp1 = g_sh.alpha_cmp.w[1];
+        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+        glUniform2ui(g_loc.alpha_cmp, 7u | (7u << 3), 0u);
+        glDrawElementsBaseVertex(GL_TRIANGLES, GLsizei(g_batch.idx.size()), GL_UNSIGNED_INT, nullptr, first);
+        if (mask >= 0) glColorMask((mask & 7) != 0, (mask & 7) != 0, (mask & 7) != 0, (mask & 8) != 0);
+        else g_applied_gen = ~0u;
+        glUniform2ui(g_loc.alpha_cmp, cmp0, cmp1);
+        if (!g_sh.alpha_cmp.valid) g_applied_gen = ~0u;
+    }
+    g_batch.verts.clear();
+    g_batch.idx.clear();
+    g_batch.boxes.clear();
+}
+
+void batch_add(const DrawCall& call, const State& s) {
+    std::vector<float>& verts = g_batch.verts;
+    std::vector<uint32_t>& idx = g_batch.idx;
+    if (g_batch.open && (verts.size() * sizeof(float) > (8u << 20) || (g_batch.early_z && g_batch.boxes.size() >= 64))) flush_batch();
+    const bool early_z = needs_replay(s);
+    if (early_z) {
+        // The box of the draw in clip space (a vertex at or behind the eye plane: the whole screen), a little widened.
+        float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+        for (uint32_t v = 0; v < call.vertex_count; ++v) {
+            const float* f = call.vertices + size_t(v) * kVertexFloats;
+            if (!(f[3] > 0.0f)) {
+                x0 = y0 = -1e30f;
+                x1 = y1 = 1e30f;
+                break;
+            }
+            const float nx = f[0] / f[3], ny = f[1] / f[3];
+            x0 = std::min(x0, nx); x1 = std::max(x1, nx); y0 = std::min(y0, ny); y1 = std::max(y1, ny);
+        }
+        x0 -= 0.01f; y0 -= 0.01f; x1 += 0.01f; y1 += 0.01f;
+        if (g_batch.open)
+            for (const auto& b : g_batch.boxes)
+                if (!(x1 < b[0] || x0 > b[2] || y1 < b[1] || y0 > b[3])) {
+                    flush_batch();  // pixels in common: the replay of the first must come before the second's draw
+                    break;
+                }
+        if (!g_batch.open) {
+            g_batch.open = true;
+            g_batch.gen = s.gen;
+        }
+        g_batch.boxes.push_back({x0, y0, x1, y1});
+    }
+    if (!g_batch.open) {
+        g_batch.open = true;
+        g_batch.gen = s.gen;
+    }
+    g_batch.early_z = early_z;
+    const uint32_t base = uint32_t(verts.size() / kVertexFloats), n = call.vertex_count;
+    verts.insert(verts.end(), call.vertices, call.vertices + size_t(n) * kVertexFloats);
+    switch (call.primitive) {
+        case kTriangles:
+            for (uint32_t i = 0; i + 2 < n; i += 3) {
+                idx.push_back(base + i);
+                idx.push_back(base + i + 1);
+                idx.push_back(base + i + 2);
+            }
+            break;
+        case kQuads:
+            for (uint32_t q = 0; q + 3 < n; q += 4) {
+                const uint32_t b = base + q;
+                const uint32_t quad[6] = {b, b + 1, b + 2, b, b + 2, b + 3};
+                idx.insert(idx.end(), quad, quad + 6);
+            }
+            break;
+        case kTriangleStrip:
+            for (uint32_t i = 0; i + 2 < n; ++i) {
+                // GL's own decomposition: every odd triangle swaps its first two vertices to keep the winding.
+                idx.push_back(base + i + (i & 1));
+                idx.push_back(base + i + 1 - (i & 1));
+                idx.push_back(base + i + 2);
+            }
+            break;
+        default:  // kTriangleFan
+            for (uint32_t i = 0; i + 2 < n; ++i) {
+                idx.push_back(base);
+                idx.push_back(base + i + 1);
+                idx.push_back(base + i + 2);
+            }
+            break;
+    }
+}
+
+}  // namespace
+
+// One draw at once, as GL's own primitive: lines, points, and the draws whose state needs a depth replay after each draw.
+static void draw_direct(const DrawCall& call, const State& s) {
     const float* data = call.vertices;
     GLenum mode = GL_TRIANGLES;
     uint32_t count = call.vertex_count;
@@ -1339,7 +1505,7 @@ void draw(const DrawCall& call, const State& s) {
     // when it is full the buffer is orphaned and filling starts over.
     constexpr size_t kVertexBytes = kVertexFloats * sizeof(float);
     constexpr size_t kRingBytes = (16u << 20) / kVertexBytes * kVertexBytes;  // a whole number of vertices
-    static size_t ring_used = 0;
+    size_t& ring_used = g_ring_used;
     static std::vector<uint8_t> oversized;  // only for a draw larger than the ring
     const size_t bytes = size_t(count) * kVertexBytes;
     // Copies the vertices to `dst`; quads become the triangles (0 1 2) (0 2 3), one vertex copy each.
@@ -1397,19 +1563,93 @@ void draw(const DrawCall& call, const State& s) {
         }
     }
     glDrawArrays(mode, first, GLsizei(count));
-    if (early_z_writes_rejected_pixels(s.bp)) {
+    if (needs_replay(s)) {
         // Z compare before texturing: pixels the alpha test rejected still update depth. Replay the
         // draw without color and without the alpha test; pixels that passed already wrote their depth
         // and fail the depth test against themselves, the rejected ones write it now. apply_state
         // restores the color mask and the alpha test uniform for the next draw.
         ++g_use.early_z_passes;
+        // The state this draw ran with, put back after the replay (a full translation of the state for every such draw was 3% of a boss frame).
+        const int mask = g_sh.color_mask;
+        const uint32_t cmp0 = g_sh.alpha_cmp.w[0], cmp1 = g_sh.alpha_cmp.w[1];
         glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
         glUniform2ui(g_loc.alpha_cmp, 7u | (7u << 3), 0u);
-        g_sh.color_mask = -1;  // the next apply_state restores both
-        g_sh.alpha_cmp.valid = false;
-        g_applied_gen = ~0u;  // the next draw translates the state again
         glDrawArrays(mode, first, GLsizei(count));
+        if (mask >= 0) glColorMask((mask & 7) != 0, (mask & 7) != 0, (mask & 7) != 0, (mask & 8) != 0);
+        else g_applied_gen = ~0u;
+        glUniform2ui(g_loc.alpha_cmp, cmp0, cmp1);
+        if (!g_sh.alpha_cmp.valid) g_applied_gen = ~0u;
     }
+}
+
+void draw(const DrawCall& call, const State& s) {
+    // GP_SKIP_DRAW=1: the draws are parsed and decoded but not given to GL (isolates the cost of the renderer and the GPU).
+    static const bool skip_draw = std::getenv("GP_SKIP_DRAW") != nullptr;
+    if (skip_draw) return;
+    bench::ScopedNs timer(g_render_stats.draw_ns);
+    struct InDraw {
+        InDraw() { g_in_draw = true; }
+        ~InDraw() { g_in_draw = false; }
+    } in_draw;
+    static uint64_t calls = 0;
+    ++calls;
+    static const bool gp_trace = std::getenv("GP_TRACE") != nullptr;
+    if ((calls == 1 || calls == 5000 || calls == 30000 || calls == 100000) && gp_trace) {
+        std::fprintf(stderr, "[GL] ---- draw #%llu\n", (unsigned long long)calls);
+        const int nst = int(((s.bp[0x00] >> 10) & 0xF) + 1);
+        std::fprintf(stderr, "[GL] draw prim=%u n=%u genmode=%06X ntev=%d zmode=%02X blend=%04X acmp=%06X\n", unsigned(call.primitive),
+                     call.vertex_count, s.bp[0], nst, s.bp[0x40], s.bp[0x41], s.bp[0xF3]);
+        std::fprintf(stderr, "[GL]   viewport wd=%g ht=%g xo=%g yo=%g zr=%g far=%g proj=%g %g %g %g %g %g ortho=%u\n",
+                     s.xf_float(0x101A), s.xf_float(0x101B), s.xf_float(0x101D), s.xf_float(0x101E), s.xf_float(0x101C),
+                     s.xf_float(0x101F), s.xf_float(0x1020), s.xf_float(0x1021), s.xf_float(0x1022), s.xf_float(0x1023),
+                     s.xf_float(0x1024), s.xf_float(0x1025), s.xf[0x1026]);
+        for (int i = 0; i < nst && i < 4; ++i)
+            std::fprintf(stderr, "[GL]   stage %d: color=%06X alpha=%06X tref=%06X ksel=%06X\n", i, s.bp[0xC0 + 2 * i], s.bp[0xC1 + 2 * i],
+                         s.bp[0x28 + i / 2], s.bp[0xF6 + i / 2]);
+        for (uint32_t v = 0; v < call.vertex_count && v < 4; ++v) {
+            const float* f = call.vertices + size_t(v) * kVertexFloats;
+            std::fprintf(stderr, "[GL]   v%u clip=(%g %g %g %g) c0=(%g %g %g %g) uv0=(%g %g %g)\n", v, f[0], f[1], f[2], f[3], f[4], f[5],
+                         f[6], f[7], f[12], f[13], f[14]);
+        }
+        std::fprintf(stderr, "[GL]   tex0 img0=%06X img3=%06X mode0=%06X\n", s.bp[0x88], s.bp[0x94], s.bp[0x80]);
+    }
+    if (const uint32_t ind = indirect_tev_stages(s.bp)) {
+        // Indirect texturing is not implemented: the draw is rendered as if the stages were direct.
+        // Say which games need it, once per distinct configuration.
+        ++g_indirect_draws;
+        static uint32_t seen[8];
+        static int nseen = 0;
+        const uint32_t sig = ind ^ (((s.bp[0x00] >> 16) & 7) << 16);
+        bool known = false;
+        for (int i = 0; i < nseen; ++i) known |= seen[i] == sig;
+        if (!known && nseen < 8) {
+            seen[nseen++] = sig;
+            std::fprintf(stderr, "[GL] indirect texturing used (draw #%llu): %u indirect stage(s), TEV stages 0x%04X; not implemented, drawn as direct\n",
+                         (unsigned long long)calls, (s.bp[0x00] >> 16) & 7, ind);
+        }
+    }
+    if (!g_efb_bound) {
+        glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+        g_efb_bound = true;
+    }
+    {
+        static uint32_t last_gen = ~0u;
+        if (s.gen == last_gen) ++g_render_stats.draws_same_state;
+        last_gen = s.gen;
+    }
+    if (g_batch.open && g_batch.gen != s.gen) flush_batch();  // the state changes below
+    apply_state(s);
+
+    // Triangles, quads, strips and fans of one state are collected and drawn as one indexed triangle list.
+    static const bool merge = std::getenv("GP_DRAW_MERGE") == nullptr || std::atoi(std::getenv("GP_DRAW_MERGE")) != 0;
+    const bool mergeable = merge && (call.primitive == kQuads || call.primitive == kTriangles || call.primitive == kTriangleStrip ||
+                                     call.primitive == kTriangleFan);
+    if (mergeable) {
+        batch_add(call, s);
+        return;
+    }
+    flush_batch();
+    draw_direct(call, s);
 }
 
 // The vertical copy filter (BP 0x53 / 0x54, efb_copy.h) of a copy; the identity unless GP_COPY_FILTER=on, and for depth.
@@ -1446,7 +1686,7 @@ static void present_filtered(const CopyRequest& r, const State& s, const CopyFil
     glDrawArrays(GL_TRIANGLES, 0, 3);
     bind_unit_texture(kEfbUnit, g_white);  // the draws' sampler for this unit must not read the texture they render to
     glBindVertexArray(g_vao);
-    glUseProgram(g_program);
+    glUseProgram(g_active);
 }
 
 // Copy a region of the EFB to main memory in the console's tiled layout (BP 0x52 with the XFB bit
@@ -1506,7 +1746,7 @@ static bool copy_to_gpu(const EfbCopyParams& p, uint32_t addr, uint32_t extent) 
     glDrawArrays(GL_TRIANGLES, 0, 3);
     bind_unit_texture(kEfbUnit, g_white);
     glBindVertexArray(g_vao);
-    glUseProgram(g_program);
+    glUseProgram(g_active);
     glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
     invalidate_shadow();  // viewport, scissor, blend, depth, cull and colour mask were changed here
     g_efb_bound = true;
@@ -1604,6 +1844,7 @@ static void copy_efb_to_memory(const State& s, uint32_t copy_cmd) {
 }
 
 void copy_efb(const CopyRequest& r, const State& s) {
+    flush_batch();  // the copy reads what the queued draws make
     if (r.diag) diag_capture_efb(r, s);
     // An EFB copy changes framebuffer bindings, viewport, scissor, color and depth masks: forget what apply_state set.
     g_efb_bound = false;

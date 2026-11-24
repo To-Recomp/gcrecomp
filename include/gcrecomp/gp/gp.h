@@ -66,6 +66,8 @@ struct RenderStats {
     uint64_t efb_gpu_copies = 0;       // of the memory copies, those kept on the GPU (read back asynchronously)
     uint64_t efb_gpu_hits = 0;         // texture uses served by such a copy instead of decoding guest memory
     uint64_t efb_guard_hits = 0;       // CPU reads that found a copy not written yet and made the GP module write it
+    uint64_t gl_draws = 0;             // glDrawElements calls (a batch of the draws above is one)
+    uint64_t draws_same_state = 0;     // draws whose GL register state equals the previous draw's (candidates for merging)
     uint64_t efb_flushes = 0;          // GPU copies whose bytes were written to guest memory
     // Wall nanoseconds spent in the renderer, measured only while GCRECOMP_BENCH is set (docs/BENCHMARK.md).
     uint64_t parse_ns = 0;             // Parser::draw: vertex decode, transform, lighting, then renderer::draw

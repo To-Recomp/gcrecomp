@@ -29,6 +29,7 @@ typedef struct __GLsync* GLsync;
 typedef std::uint64_t GLuint64;
 
 #define GL_ALWAYS 0x0207
+#define GL_ELEMENT_ARRAY_BUFFER 0x8893
 #define GL_ALREADY_SIGNALED 0x911A
 #define GL_CONDITION_SATISFIED 0x911C
 #define GL_MAP_READ_BIT 0x0001
@@ -160,6 +161,7 @@ typedef std::uint64_t GLuint64;
     X(GLenum, glClientWaitSync, (GLsync sync, GLbitfield flags, GLuint64 timeout)) \
     X(void, glDeleteSync, (GLsync sync)) \
     X(void, glDrawArrays, (GLenum mode, GLint first, GLsizei count)) \
+    X(void, glDrawElementsBaseVertex, (GLenum mode, GLsizei count, GLenum type, const void *indices, GLint basevertex)) \
     X(void, glEnable, (GLenum cap)) \
     X(void, glEnableVertexAttribArray, (GLuint index)) \
     X(void, glFramebufferRenderbuffer, (GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer)) \

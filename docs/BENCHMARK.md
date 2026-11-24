@@ -265,3 +265,39 @@ Result on the iGPU test box (Radeon 610M, headless; `tos-vidarr.txt`, boss segme
 `tos-battle.txt` (the owner's other card): 9 039 of 9 476 copies stay on the GPU, `GP_EFB_COPY_VERIFY` finds 0 of 7 200 checked different, 0 guard hits, 0 unknown GP commands.
 Pictures: the scripted cutscene frames of the two builds compare at RMSE 0.00 to 0.9 (idle sway of characters and the world map's camera), the battle-start shatter effect, which samples the copy, looks as expected.
 With the stall gone the main thread is the limit (80% of a core at 59 fps): the next costs are the ones listed above (vertex decode, lighting, GL calls).
+
+## Recording a scene and replaying it (`GP_RECORD`, `tools/gp_replay`)
+
+A scene that takes minutes of play to reach (the boss fight needs 100 s of script) is a poor loop for optimising. `GP_RECORD=FILE[:FRAMES]` makes the GP module
+write, at the first heavy frame it sees, a snapshot of guest RAM and of the GP register state, then every byte fed to the command parser for FRAMES presented
+frames (default 30). The frame that triggers is one with at least `GP_RECORD_MIN_DRAWS` draws (default 8500) that took two retraces or more (`GP_RECORD_SLOW=0`
+drops that condition), and only after `GP_RECORD_AFTER` seconds of the run:
+
+```
+GP_RECORD=/var/tmp/boss.gprec:40 GP_RECORD_AFTER=104 tools/benchmark.py ... --script tools/input-scripts/tos-vidarr.txt ...   # the boss fight is at 104 s
+SDL_VIDEO_DRIVER=offscreen build/gp_replay /var/tmp/boss.gprec --loops 6
+perf record -F 999 build/gp_replay /var/tmp/boss.gprec --loops 40        # a profile of the parser and renderer alone
+TOS_SCREENSHOT_DIR=/var/tmp/s GP_SHOT_EVERY=4 build/gp_replay boss.gprec --loops 1   # PPM frames: cmp two builds, bit for bit
+```
+
+`gp_replay` replays without the CPU, flat out, and prints per loop the time per frame, the draws, the parse time (decode plus renderer) and the renderer's share,
+the read-back wait, and how many draws had the state of the previous one and how many GL draw calls were made. A replay is deterministic: two loops agree within
+a few percent, and the pictures of two runs are byte-identical when the renderer is. The guest memory is the one at the start of the recording, so vertex arrays and
+textures the CPU rewrote during it are not replayed (values change, the cost does not). A recording is 25 MB of RAM plus the stream (15 MB for 40 boss frames) and holds
+game data: keep it out of git.
+
+## Draw batching and early fragment tests
+
+In the replay of 40 boss frames (10 600 draws, 91 000 vertices a frame) 99% of the draws had the GL state of the previous one, yet each made
+three GL calls for its vertices and, being alpha-tested with Z compare before texturing, a second draw with the colour mask and the alpha test changed (the depth
+write of pixels the alpha test rejects). That second draw was 5.5 of the 7 ms the renderer spent per frame.
+
+* Triangles, quads, strips and fans of one state (`State::gen` unchanged, same textures; anything that changes GL state calls `flush_batch()` first) are collected
+  and drawn as one indexed triangle list: strips and fans become the triangles GL makes of them, a quad two triangles. `GP_DRAW_MERGE=0` draws every one at once.
+* The fragment shader has a second program with `layout(early_fragment_tests) in;` (GL_ARB_shader_image_load_store): the depth test and the depth write happen before the
+  shader, so a discarded fragment has written its depth, which is what the hardware does. It is used for the draws that needed the replay, so they need none
+  (`GP_EARLY_TESTS=0` or a driver without the extension: the replay of the old code, the group of draws then limited to ones that share no pixel: boxes in clip space).
+
+Replay of the boss recording on the iGPU box (parse = decode plus renderer, per frame): 13.1 ms, parse 11.8 (renderer 7.0) before; **8.9 ms, parse 5.4 (renderer 1.2)** after;
+GL draw calls per frame 21 000 to 96. The 40 presented frames compare byte for byte with those of `GP_DRAW_MERGE=0 GP_EARLY_TESTS=0`. In the game (`tos-vidarr.txt`, boss segment, one run
+each): fps 57.8 (min 45) to **59.8 (min 58)**, main thread CPU 77% to 56%, `parse_ms` 444 to 318 and `draw_ms` 234 to 104 a second.

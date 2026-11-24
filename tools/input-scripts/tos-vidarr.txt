@@ -37,6 +37,6 @@ wait 200; shot e3
 press-until-file top2btl.rel A every=40 hold=5 timeout=60                       # through the dialogue to the first battle
 shot b1
 wait 300; shot b2
-press-until-file s/bgm_b010.song A every=12 hold=4 timeout=200                   # A-mash: soldiers, then the boss
+press-until-file s/bgm_b010.song A every=12 hold=4 timeout=200                   # A-mash: soldiers, then the boss (record it: GP_RECORD, docs/BENCHMARK.md)
 shot end1
 wait 300; shot end2

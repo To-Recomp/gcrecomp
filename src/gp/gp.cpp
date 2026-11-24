@@ -8,6 +8,7 @@
 
 #include "gp_internal.h"
 #include "gcrecomp/runtime.h"
+#include "gp_record.h"
 #include "input.h"
 
 namespace gcrecomp::gp {
@@ -20,6 +21,7 @@ bool init(const Config& config) {
         if (g_graphics) renderer::flush_copies();
     };
     if (g_graphics) input::init(config.input_config);
+    record::configure_from_env();
     bench::start();
     return g_graphics;
 }
