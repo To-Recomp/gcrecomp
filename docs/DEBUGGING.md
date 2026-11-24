@@ -22,7 +22,7 @@ Switches and tools for finding out why a frame looks wrong. Nothing here needs a
 | `GP_TRACE_TEX=1` | Logs every texture decode (`[TEX] frame N decode map=M addr=ADDR fmt=F WxH levels=L REASON data=H palette=P`): the reason is `new`, `data changed` (the game rewrote the texture or an EFB copy landed in it) or `palette changed` (a palette format whose TLUT was loaded with other contents), with the hashes. A texture decoded every frame shows here; `GCRECOMP_BENCH` counts them (`texdec=`). |
 | `GP_SKIP_DRAW=1` | The draws are parsed and decoded but not given to GL: isolates the cost of the renderer and the GPU (a game that adapts its frame rate to the host runs faster; see docs/BENCHMARK.md, the first temple boss). The picture stays empty. |
 | `GP_APPLY_ALWAYS=1` | The renderer translates the BP/XF register state to GL for every draw instead of only after a register changed (`State::gen`): for comparing pictures with and without the skip. |
-| `GP_COPY_FILTER=off` | Ignores the vertical copy filter (BP 0x53 / 0x54, docs/EFB_COPY.md): copies and presented frames are not blurred by the deflicker taps a game sets. For comparing with and without it. |
+| `GP_COPY_FILTER=on` | Applies the vertical copy filter (BP 0x53 / 0x54, docs/EFB_COPY.md) to copies and presented frames: the deflicker taps a game sets then blur them as on a console. Off by default (implemented, not yet compared with hardware or Dolphin). |
 | `GCRECOMP_DIAG_DIR=dir` | Where diagnostic bundles (below) are written; without it the screenshot directory of the host program (`TOS_SCREENSHOT_DIR`), without that the current directory. |
 
 ## The diagnostic bundle (F10)

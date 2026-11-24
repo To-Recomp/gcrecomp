@@ -36,7 +36,7 @@ destination outside RAM is ignored with a message on stderr. Texture copies do n
 
 ## Vertical copy filter (BP 0x53 / 0x54)
 
-Every colour copy, to a texture or to the XFB, goes through a vertical filter. BP 0x53 holds the taps `c0..c3` and BP 0x54
+Every colour copy, to a texture or to the XFB, goes through a vertical filter on hardware. BP 0x53 holds the taps `c0..c3` and BP 0x54
 `c4..c6`, 6 bits each from bit 0. The SDK's `GXSetCopyFilter(aa, sample_pattern, vf, vfilter)` writes both for every copy: with
 `vf` false (or a render mode without deflicker) the taps are `0 0 21 22 21 0 0`, the render modes with deflicker use
 `8 8 10 12 10 8 8`. There is no enable bit in BP 0x52, 0x53 or 0x54.
@@ -51,8 +51,12 @@ never called `GXSetCopyFilter`) counts as unfiltered, not as black.
 
 The lines above the first and below the last of the copy rectangle are read from the EFB, unless the clamp bit of that side
 (command bits 0 and 1) says to repeat the edge line, or the rectangle touches the edge of the EFB. Tales of Symphonia (PAL)
-sets deflicker taps and both clamp bits for every copy, texture copies included, so its frames are softened by 1-2-1 in
-the vertical direction, as on a console; `GP_COPY_FILTER=off` presents and copies them unfiltered.
+sets deflicker taps and both clamp bits for every copy, texture copies included.
+
+**The filter is implemented but disabled by default** (`GP_COPY_FILTER=on` enables it), pending a comparison with a console or
+Dolphin: the 1-2-1 grouping of the seven taps is a documented model, not a measurement, and the owner already finds the picture
+soft. To compare: record a diagnostic bundle (F10, docs/DEBUGGING.md) in the same scene with and without `GP_COPY_FILTER=on` and
+set `window.ppm` against a reference frame (`tools/frame_compare.py`); `efb-xfb.ppm` is the EFB the filter reads.
 
 Implementation: texture copies read the lines of the rectangle plus the margins back and filter them on the CPU before encoding
 (`apply_copy_filter`, `tests/efb_copy_test.cpp`); a presented frame is drawn into the window by a small pass that samples the

@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "gl_loader.h"
+#include "test_env.h"
 #include "gp_internal.h"
 
 using namespace gcrecomp::gp;
@@ -84,6 +85,7 @@ static void expect_presented(const std::filesystem::path& dir, const char* what,
 }
 
 int main() {
+    set_env("GP_COPY_FILTER", "on");  // off by default
     const std::filesystem::path shots = std::filesystem::temp_directory_path() / "gp_render_check_frames";
     std::filesystem::remove_all(shots);
     std::filesystem::create_directories(shots);

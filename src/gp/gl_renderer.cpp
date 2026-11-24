@@ -781,7 +781,7 @@ void apply_register_state(const State& s) {
 }
 
 void print_feature_use() {
-    if (g_use.filtered_copies) std::fprintf(stderr, "[GL] %llu EFB copies went through the vertical copy filter (GP_COPY_FILTER=off disables it)\n", (unsigned long long)g_use.filtered_copies);
+    if (g_use.filtered_copies) std::fprintf(stderr, "[GL] %llu EFB copies went through the vertical copy filter (GP_COPY_FILTER=on)\n", (unsigned long long)g_use.filtered_copies);
     std::fprintf(stderr, "[GL] feature use: C14X2 textures %llu, mipmapped textures %llu, fog draws %llu, constant-alpha draws %llu, logic-op draws %llu, early-Z passes %llu, TEV compare-mode draws %llu\n",
                  (unsigned long long)g_use.c14x2_textures, (unsigned long long)g_use.mip_textures, (unsigned long long)g_use.fog_draws,
                  (unsigned long long)g_use.const_alpha_draws, (unsigned long long)g_use.logic_op_draws, (unsigned long long)g_use.early_z_passes, (unsigned long long)g_use.tev_compare_draws);
@@ -1169,13 +1169,13 @@ void draw(const DrawCall& call, const State& s) {
     }
 }
 
-// The vertical copy filter (BP 0x53 / 0x54, efb_copy.h) of a copy; the identity when GP_COPY_FILTER=off or for depth.
+// The vertical copy filter (BP 0x53 / 0x54, efb_copy.h) of a copy; the identity unless GP_COPY_FILTER=on, and for depth.
 static CopyFilter copy_filter_of(const State& s, bool depth) {
-    static const bool off = [] {
+    static const bool on = [] {
         const char* v = std::getenv("GP_COPY_FILTER");
-        return v && (!std::strcmp(v, "off") || !std::strcmp(v, "0"));
+        return v && (!std::strcmp(v, "on") || !std::strcmp(v, "1"));
     }();
-    return (depth || off) ? CopyFilter() : make_copy_filter(s.bp[0x53], s.bp[0x54]);
+    return (depth || !on) ? CopyFilter() : make_copy_filter(s.bp[0x53], s.bp[0x54]);
 }
 
 // Presents the copied EFB region through the copy filter: each window pixel shows
