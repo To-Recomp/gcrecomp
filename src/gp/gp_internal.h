@@ -55,6 +55,7 @@ struct CopyRequest {
     bool to_xfb;  // copy to the external frame buffer (a frame is complete)
     bool clear;   // clear the EFB afterwards
     int x, y, w, h;
+    bool diag = false;  // a diagnostic bundle is recording this frame (diag.h): the renderer keeps the EFB picture of the copy
 };
 
 // Parser state (gp_parser.cpp). `g_graphics` says whether vertices are decoded and handed to the

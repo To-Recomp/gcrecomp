@@ -255,6 +255,10 @@ bool parse_command(const std::vector<std::string>& w, const std::string& src, st
         c.kind = CmdKind::Shot;
         if (!need_args(1)) return fail("shot takes a file name (written as NAME.ppm in the screenshot directory)");
         c.text = args[0];
+    } else if (verb == "diag") {
+        c.kind = CmdKind::Diag;
+        if (!need_args(1)) return fail("diag takes a name (part of the bundle's directory name: diag-<n>-<time>-NAME)");
+        c.text = args[0];
     } else {
         return fail("unknown command '" + w[0] + "'");
     }
@@ -307,6 +311,12 @@ bool Script::needs_signature() const {
 std::vector<std::string> Script::take_shots() {
     std::vector<std::string> out;
     out.swap(shots_);
+    return out;
+}
+
+std::vector<std::string> Script::take_diags() {
+    std::vector<std::string> out;
+    out.swap(diags_);
     return out;
 }
 
@@ -397,6 +407,7 @@ uint16_t Script::step(const Observation& o) {
             case CmdKind::Press:
             case CmdKind::Stick:
             case CmdKind::TraceFrame:
+            case CmdKind::Diag:
             case CmdKind::Shot: break;
         }
         if (!done && c.timeout > 0 && o.seconds - start_seconds_ >= c.timeout) {
@@ -407,6 +418,7 @@ uint16_t Script::step(const Observation& o) {
         if (c.kind == CmdKind::Press) holds_.push_back({c.mask, o.frame + c.count});
         if (c.kind == CmdKind::Stick) holds_.push_back({0, o.frame + c.count, c.sx, c.sy, true, c.sub});
         if (c.kind == CmdKind::Shot) shots_.push_back(c.text);
+        if (c.kind == CmdKind::Diag) diags_.push_back(c.text);
         if (c.kind == CmdKind::TraceFrame) traces_.push_back(c.count);
         ++pc_;
         started_ = false;

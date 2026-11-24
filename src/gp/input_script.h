@@ -36,7 +36,7 @@ struct Observation {
     std::vector<std::string> files;         // disc files opened since the previous step, in order
 };
 
-enum class CmdKind { At, Press, Wait, WaitSeconds, WaitPresented, WaitFile, WaitChange, WaitStill, Shot, PressUntilFile, TraceFrame, Stick, StickUntilFile };
+enum class CmdKind { At, Press, Wait, WaitSeconds, WaitPresented, WaitFile, WaitChange, WaitStill, Shot, PressUntilFile, TraceFrame, Stick, StickUntilFile, Diag };
 
 struct Command {
     CmdKind kind = CmdKind::Wait;
@@ -50,7 +50,7 @@ struct Command {
     double seconds = 0;      // WaitSeconds: duration
     double threshold = 0.05; // WaitChange / WaitStill: signature difference that counts as a change
     double timeout = 0;      // seconds of wall time after which a wait gives up (0 = never)
-    std::string text;        // WaitFile: path substring; Shot: file name; (the source text of the command otherwise)
+    std::string text;        // WaitFile: path substring; Shot: file name; Diag: bundle name; (the source text of the command otherwise)
     std::string source;      // the command as written, for log lines
 };
 
@@ -74,6 +74,8 @@ public:
     std::vector<int> take_traces();
     // Screenshot names requested since the last call.
     std::vector<std::string> take_shots();
+    // Diagnostic bundle names requested (`diag NAME`) since the last call.
+    std::vector<std::string> take_diags();
     // One line per command that started a wait or ran, for the host's log (drained by the caller).
     std::vector<std::string> take_log();
 
@@ -96,7 +98,7 @@ private:
     size_t file_cursor_ = 0;  // index in the current Observation::files not yet consumed
     std::vector<Hold> holds_;
     Sticks sticks_;
-    std::vector<std::string> shots_, log_;
+    std::vector<std::string> shots_, diags_, log_;
     std::vector<int> traces_;
 };
 

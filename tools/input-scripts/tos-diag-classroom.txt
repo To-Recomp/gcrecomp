@@ -1,0 +1,6 @@
+# Tales of Symphonia: a diagnostic bundle (docs/DEBUGGING.md, "The diagnostic bundle") of the classroom dialogue, after
+# tos-new-game.txt (run both: tools/run-scripted.sh ... --script tos-new-game.txt --script tos-diag-classroom.txt).
+# The bundle goes to the screenshot directory of the run (diag-<n>-<time>-classroom/).
+press A; wait 200
+diag classroom
+wait 30

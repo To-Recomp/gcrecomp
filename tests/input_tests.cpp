@@ -178,6 +178,11 @@ static void test_keymap_toml() {
     CHECK(err.rfind("line 3", 0) == 0);
     CHECK(m.keys[kCtlA] == before.keys[kCtlA]);  // the valid line before the error was not applied
     CHECK(!parse_keymap("a = \"J\"\n", m, err) && err.rfind("line 1", 0) == 0);
+    // F10 is the diagnostic hotkey: no pad control may take it (the map is left as it was).
+    CHECK(is_reserved_key(SDL_SCANCODE_F10) && !is_reserved_key(SDL_SCANCODE_F9) && !is_reserved_key(SDL_SCANCODE_Z));
+    CHECK(!parse_keymap("[keyboard]\na = [\"J\", \"F10\"]\n", m, err) && err.rfind("line 2", 0) == 0 && err.find("diagnostic") != std::string::npos);
+    for (int c = 0; c < kControlCount; ++c)
+        for (int k : default_keymap().keys[c]) CHECK(!is_reserved_key(k));
     CHECK(!parse_keymap("[keyboard]\nturbo = \"J\"\n", m, err) && err.rfind("line 2", 0) == 0);
     CHECK(!parse_keymap("[keyboard]\na = [\"J\"\n", m, err));
     CHECK(!parse_keymap("[pad]\n", m, err));

@@ -10,13 +10,17 @@
 #include <algorithm>
 #include <cmath>
 #include <atomic>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <string>
 
 #include "gcrecomp/bench.h"
 #include "gcrecomp/runtime.h"
 #include "gp_internal.h"
+#include "diag.h"
+#include "gp_decode.h"
 #include "lighting.h"
 
 namespace gcrecomp::gp {
@@ -48,6 +52,23 @@ bool tracing_frame() {
     const long requested = g_trace_request.load(std::memory_order_relaxed);
     const long trace_frame = requested >= 0 ? requested : env_trace_frame;
     return trace_frame >= 0 && uint64_t(trace_frame) == g_frames;
+}
+
+// One line of the trace of the frame being drawn: GP_TRACE_FRAME sends it to stderr, a diagnostic bundle (diag.h) keeps it
+// for diag.txt. `to_stderr` and `to_diag` say which of the two are on for this frame.
+void trace_emit(bool to_stderr, bool to_diag, const char* fmt, ...)
+#if defined(__GNUC__)
+    __attribute__((format(printf, 3, 4)))
+#endif
+    ;
+void trace_emit(bool to_stderr, bool to_diag, const char* fmt, ...) {
+    std::string line;
+    va_list ap;
+    va_start(ap, fmt);
+    diag::vappendf(line, fmt, ap);
+    va_end(ap);
+    if (to_stderr) std::fputs(line.c_str(), stderr);
+    if (to_diag) diag::g_bundle.trace += line;
 }
 
 uint32_t be32(const uint8_t* p) {
@@ -476,6 +497,36 @@ private:
         }
     }
 
+    // The EFB copy and the registers it reads, for GP_TRACE_FRAME and the diagnostic bundle: the copy command's
+    // fields (BP 0x52), the source rectangle, destination, stride, Y scale, the vertical filter taps (BP 0x53/0x54),
+    // the pixel format and the clear values.
+    std::string copy_text(const CopyRequest& r, uint32_t value) const {
+        const State& s = g_state;
+        std::string t;
+        using diag::appendf;
+        appendf(t, "[COPY] to_xfb=%d clear=%d src=(%d,%d) %dx%d cmd=%06X dest=0x%06X stride=%u pe_control=%06X (pixel format %u, z format %u) clear AR=%06X GB=%06X z=%06X\n",
+                r.to_xfb, r.clear, r.x, r.y, r.w, r.h, value, (s.bp[0x4B] & 0xFFFFFF) << 5, s.bp[0x4D] & 0x3FF, s.bp[0x43], s.bp[0x43] & 7,
+                (s.bp[0x43] >> 3) & 7, s.bp[0x4F], s.bp[0x50], s.bp[0x51]);
+        const uint32_t fmt = ((value >> 4) & 7) | (((value >> 3) & 1) << 3);
+        const bool depth = (s.bp[0x43] & 7) == 3;
+        const uint32_t yreg = s.bp[0x4E] & 0x1FF;
+        int ow = r.w, oh = r.h;
+        if ((value >> 9) & 1) ow = std::max(ow / 2, 1), oh = std::max(oh / 2, 1);
+        if (((value >> 10) & 1) && yreg) oh = std::max(int((uint64_t(oh) * 256 + yreg / 2) / yreg), 1);
+        appendf(t, "[COPY]   %s format=%X%s clamp(top=%u bottom=%u) yuv=%u gamma=%u half_scale/mipmap=%u y_scale=%u (bp4E=%03X: x%g) frame_to_field=%u intensity=%u bit16=%u -> %dx%d texels\n",
+                depth ? "depth" : "colour", fmt, ((value >> 15) & 1) ? " (intensity: luma)" : "", value & 1, (value >> 1) & 1, (value >> 2) & 1,
+                (value >> 7) & 3, (value >> 9) & 1, (value >> 10) & 1, yreg, yreg ? 256.0 / yreg : 0.0, (value >> 12) & 3, (value >> 15) & 1,
+                (value >> 16) & 1, ow, oh);
+        const uint32_t f53 = s.bp[0x53], f54 = s.bp[0x54];
+        const int c[7] = {int(f53 & 63), int((f53 >> 6) & 63), int((f53 >> 12) & 63), int((f53 >> 18) & 63), int(f54 & 63), int((f54 >> 6) & 63), int((f54 >> 12) & 63)};
+        const int top = c[0] + c[1], mid = c[2] + c[3] + c[4], bottom = c[5] + c[6];
+        appendf(t, "[COPY]   vertical filter bp53=%06X bp54=%06X taps %d %d %d %d %d %d %d: lines above/this/below = %d/%d/%d of 64 (%s; there is no enable bit, the SDK always writes the taps; 0 0 21 22 21 0 0 = unfiltered)\n",
+                f53, f54, c[0], c[1], c[2], c[3], c[4], c[5], c[6], top, mid, bottom, (top == 0 && mid == 64 && bottom == 0) ? "identity" : "ACTIVE");
+        appendf(t, "[COPY]   bp47/48 token=%06X sample pattern bp01..04=%06X %06X %06X %06X genmode=%06X (msaa %u)\n", s.bp[0x48], s.bp[1], s.bp[2], s.bp[3], s.bp[4], s.bp[0],
+                (s.bp[0] >> 9) & 1);
+        return t;
+    }
+
     void efb_copy(uint32_t value) {
         const State& s = g_state;
         CopyRequest r;
@@ -486,31 +537,90 @@ private:
         r.y = int((tl >> 10) & 0x3FF);
         r.w = int(br & 0x3FF) + 1;
         r.h = int((br >> 10) & 0x3FF) + 1;
-        if (tracing_frame())
-            std::fprintf(stderr, "[COPY] to_xfb=%d clear=%d src=(%d,%d) %dx%d cmd=%06X dest=0x%06X stride=%u pe_control=%06X (pixel format %u, z format %u) clear AR=%06X GB=%06X z=%06X\n",
-                         r.to_xfb, r.clear, r.x, r.y, r.w, r.h, value, (s.bp[0x4B] & 0xFFFFFF) << 5, s.bp[0x4D] & 0x3FF, s.bp[0x43], s.bp[0x43] & 7,
-                         (s.bp[0x43] >> 3) & 7, s.bp[0x4F], s.bp[0x50], s.bp[0x51]);
+        // A diagnostic bundle (diag.h) covers one whole frame: it starts after the XFB copy that follows the request and
+        // ends with the next one, which is recorded as well. The copy that starts it belongs to the frame before.
+        const diag::Trigger::Edge edge = r.to_xfb ? diag::g_trigger.frame_presented() : diag::Trigger::Edge::None;
+        if (edge == diag::Trigger::Edge::Begin) diag::g_bundle.reset();
+        r.diag = diag::g_trigger.capturing() && edge != diag::Trigger::Edge::Begin;
+        const bool trace_stderr = tracing_frame();
+        if (trace_stderr || r.diag) {
+            const std::string text = copy_text(r, value);
+            if (trace_stderr) std::fputs(text.c_str(), stderr);
+            if (r.diag) {
+                diag::Bundle& b = diag::g_bundle;
+                b.trace += text;
+                b.count(r.to_xfb ? "efb copies to the XFB" : "efb copies to a texture");
+                diag::note_copy_features(b, value, s.bp[0x53], s.bp[0x54], (s.bp[0x43] & 7) == 3);
+            }
+        }
         if (g_graphics) renderer::copy_efb(r, g_state);
+        if (r.diag && edge == diag::Trigger::Edge::Finish) diag::finish(g_frames);
         if (r.to_xfb) ++g_frames;
     }
 
-    void dump_state() const {
+    // The register state a draw runs with, one [STATE] line per unit: what GP_TRACE_STATE prints and a diagnostic bundle
+    // records for every draw whose state differs from the previous one's.
+    std::string state_text() const {
         const State& s = g_state;
-        std::fprintf(stderr, "[STATE] gen=%06X zmode=%02X blend=%04X/%04X acmp=%06X scissor=%06X/%06X cullmode=%u\n", s.bp[0], s.bp[0x40], s.bp[0x41], s.bp[0x42],
-                     s.bp[0xF3], s.bp[0x20], s.bp[0x21], (s.bp[0] >> 14) & 3);
+        std::string t;
+        using diag::appendf;
+        const uint32_t zm = s.bp[0x40], cm0 = s.bp[0x41], cm1 = s.bp[0x42], ac = s.bp[0xF3];
+        appendf(t, "[STATE] gen=%06X zmode=%02X blend=%04X/%04X acmp=%06X scissor=%06X/%06X cullmode=%u\n", s.bp[0], zm, cm0, cm1, ac, s.bp[0x20], s.bp[0x21], (s.bp[0] >> 14) & 3);
+        const BlendState bl = decode_blend(cm0, cm1);
+        appendf(t, "[STATE]   z: test=%u func=%u write=%u early=%u | blend=%u logic=%u(op %u) src=%u dst=%u subtract=%u colour_update=%u alpha_update=%u dither=%u dst_alpha=%u(%u) | alpha test: c0=%u ref0=%u logic=%u c1=%u ref1=%u\n",
+                zm & 1, (zm >> 1) & 7, (zm >> 4) & 1, (s.bp[0x43] >> 6) & 1, bl.blend, bl.logic_op, bl.logic_mode, bl.src_factor, bl.dst_factor, bl.subtract, bl.color_update,
+                bl.alpha_update, (cm0 >> 2) & 1, bl.const_alpha, bl.const_alpha_value, (ac >> 16) & 7, ac & 0xFF, (ac >> 22) & 3, (ac >> 19) & 7, (ac >> 8) & 0xFF);
+        const uint32_t stl = s.bp[0x20], str = s.bp[0x21];
+        appendf(t, "[STATE]   viewport wd=%g ht=%g xo=%g yo=%g zr=%g far=%g efb_offset=%06X | scissor (%d,%d)-(%d,%d) | projection %g %g %g %g %g %g %s\n",
+                s.xf_float(0x101A), s.xf_float(0x101B), s.xf_float(0x101D), s.xf_float(0x101E), s.xf_float(0x101C), s.xf_float(0x101F), s.bp[0x59],
+                int((stl >> 12) & 0x7FF) - 342, int(stl & 0x7FF) - 342, int((str >> 12) & 0x7FF) - 342, int(str & 0x7FF) - 342, s.xf_float(0x1020), s.xf_float(0x1021),
+                s.xf_float(0x1022), s.xf_float(0x1023), s.xf_float(0x1024), s.xf_float(0x1025), s.xf[0x1026] ? "orthographic" : "perspective");
+        static const char* const cin[16] = {"CPREV", "APREV", "C0", "A0", "C1", "A1", "C2", "A2", "TEXC", "TEXA", "RASC", "RASA", "1", "0.5", "KONST", "0"};
+        static const char* const ain[8] = {"APREV", "A0", "A1", "A2", "TEXA", "RASA", "KONST", "0"};
+        static const char* const bias[4] = {"+0", "+0.5", "-0.5", "COMPARE"};
+        static const char* const scale[4] = {"x1", "x2", "x4", "x0.5"};
+        static const char* const dest[4] = {"PREV", "C0", "C1", "C2"};
         const int nst = int(((s.bp[0] >> 10) & 0xF) + 1);
-        for (int i = 0; i < nst; ++i)
-            std::fprintf(stderr, "[STATE] stage%d color=%06X alpha=%06X tref=%06X ksel=%06X\n", i, s.bp[0xC0 + 2 * i], s.bp[0xC1 + 2 * i], s.bp[0x28 + i / 2],
-                         s.bp[0xF6 + i / 2]);
+        bool used[8] = {};
+        for (int i = 0; i < nst; ++i) {
+            const uint32_t ce = s.bp[0xC0 + 2 * i], ae = s.bp[0xC1 + 2 * i], tref = s.bp[0x28 + i / 2], ksel = s.bp[0xF6 + i / 2];
+            appendf(t, "[STATE] stage%d color=%06X alpha=%06X tref=%06X ksel=%06X\n", i, ce, ae, tref, ksel);
+            const uint32_t tb = (i & 1) ? (tref >> 12) : tref;
+            if ((tb >> 6) & 1) used[tb & 7] = true;
+            appendf(t, "[STATE]   stage%d: rgb %s = (%s %s lerp(%s,%s,%s) %s) %s clamp=%u | a %s = (%s %s lerp(%s,%s,%s) %s) %s clamp=%u | tex map%u coord%u %s ras chan%u | kcolor sel %u kalpha sel %u\n",
+                    i, dest[(ce >> 22) & 3], cin[ce & 15], (ce >> 18) & 1 ? "-" : "+", cin[(ce >> 12) & 15], cin[(ce >> 8) & 15], cin[(ce >> 4) & 15], bias[(ce >> 16) & 3],
+                    scale[(ce >> 20) & 3], (ce >> 19) & 1, dest[(ae >> 22) & 3], ain[(ae >> 4) & 7], (ae >> 18) & 1 ? "-" : "+", ain[(ae >> 13) & 7], ain[(ae >> 10) & 7],
+                    ain[(ae >> 7) & 7], bias[(ae >> 16) & 3], scale[(ae >> 20) & 3], (ae >> 19) & 1, tb & 7, (tb >> 3) & 7, (tb >> 6) & 1 ? "on" : "off", (tb >> 7) & 7,
+                    (i & 1) ? (ksel >> 14) & 31 : (ksel >> 4) & 31, (i & 1) ? (ksel >> 19) & 31 : (ksel >> 9) & 31);
+        }
         for (int i = 0; i < 4; ++i)
-            std::fprintf(stderr, "[STATE] reg%d=(%g %g %g %g) konst%d=(%g %g %g %g)\n", i, s.tev_reg[i][0], s.tev_reg[i][1], s.tev_reg[i][2], s.tev_reg[i][3], i,
-                         s.tev_konst[i][0], s.tev_konst[i][1], s.tev_konst[i][2], s.tev_konst[i][3]);
+            appendf(t, "[STATE] reg%d=(%g %g %g %g) konst%d=(%g %g %g %g)\n", i, s.tev_reg[i][0], s.tev_reg[i][1], s.tev_reg[i][2], s.tev_reg[i][3], i,
+                    s.tev_konst[i][0], s.tev_konst[i][1], s.tev_konst[i][2], s.tev_konst[i][3]);
         for (int i = 0; i < 8; ++i)
-            std::fprintf(stderr, "[STATE] texgen%d info=%05X  map%d mode0=%06X img0=%06X img3=%06X\n", i, s.xf[0x1040 + i], i, s.bp[0x80 + (i < 4 ? i : i + 0x1C)],
-                         s.bp[0x88 + (i < 4 ? i : i + 0x1C)], s.bp[0x94 + (i < 4 ? i : i + 0x1C)]);
-        std::fprintf(stderr, "[STATE] fog=%06X/%06X/%06X/%06X colour=%06X range=%06X/%06X ind=%06X genmode_ind=%u\n", s.bp[0xEE], s.bp[0xEF], s.bp[0xF0], s.bp[0xF1],
-                     s.bp[0xF2], s.bp[0xE8], s.bp[0xE9], s.bp[0x10], (s.bp[0] >> 16) & 7);
+            appendf(t, "[STATE] texgen%d info=%05X  map%d mode0=%06X img0=%06X img3=%06X\n", i, s.xf[0x1040 + i], i, s.bp[0x80 + (i < 4 ? i : i + 0x1C)],
+                    s.bp[0x88 + (i < 4 ? i : i + 0x1C)], s.bp[0x94 + (i < 4 ? i : i + 0x1C)]);
+        static const char* const wrap[4] = {"clamp", "repeat", "mirror", "?"};
+        static const char* const minf[8] = {"nearest", "nearest/mip-nearest", "nearest/mip-linear", "?", "linear", "linear/mip-nearest", "linear/mip-linear", "?"};
+        for (int m = 0; m < 8; ++m) {
+            if (!used[m]) continue;
+            const uint32_t mode0 = s.bp[m < 4 ? 0x80 + m : 0xA0 + (m - 4)], mode1 = s.bp[m < 4 ? 0x84 + m : 0xA4 + (m - 4)];
+            const uint32_t img0 = s.bp[m < 4 ? 0x88 + m : 0xA8 + (m - 4)], img3 = s.bp[m < 4 ? 0x94 + m : 0xB4 + (m - 4)];
+            const uint32_t w = (img0 & 0x3FF) + 1, h = ((img0 >> 10) & 0x3FF) + 1, fmt = (img0 >> 20) & 0xF;
+            appendf(t, "[STATE]   map%d: %ux%u fmt=%X addr=%06X wrap=%s/%s mag=%s min=%s lod_bias=%g lod=[%g,%g] levels=%u (mode0=%06X mode1=%06X)\n", m, w, h, fmt,
+                    (img3 & 0xFFFFFF) << 5, wrap[mode0 & 3], wrap[(mode0 >> 2) & 3], (mode0 & 0x10) ? "linear" : "nearest", minf[(mode0 >> 5) & 7], lod_bias_of(mode0),
+                    min_lod_of(mode1), max_lod_of(mode1), mip_level_count(w, h, mode0, mode1), mode0, mode1);
+        }
+        const FogParams fog = decode_fog(s.bp);
+        appendf(t, "[STATE] fog=%06X/%06X/%06X/%06X colour=%06X range=%06X/%06X ind=%06X genmode_ind=%u\n", s.bp[0xEE], s.bp[0xEF], s.bp[0xF0], s.bp[0xF1],
+                s.bp[0xF2], s.bp[0xE8], s.bp[0xE9], s.bp[0x10], (s.bp[0] >> 16) & 7);
+        const bool range_adjust = (s.bp[0xE8] >> 10) & 1;
+        const uint32_t indirect = indirect_tev_stages(s.bp);
+        appendf(t, "[STATE]   fog type=%u%s ortho=%u | range adjust %s (centre %u)%s | indirect TEV stages mask=%X%s\n", fog.type, fog.type == kFogOff ? " (off)" : "", fog.ortho,
+                range_adjust ? "ON" : "off", s.bp[0xE8] & 0x3FF, range_adjust ? " NOT IMPLEMENTED" : "", indirect, indirect ? " NOT IMPLEMENTED" : "");
+        return t;
     }
+
+    void dump_state() const { std::fputs(state_text().c_str(), stderr); }
 
     void draw(Primitive prim, uint32_t count, const Layout& l, const uint8_t* data) {
         if (count == 0) return;
@@ -534,33 +644,62 @@ private:
         unpack_rgba8(s.xf[0x100D], mat_color[1]);
 
         const uint32_t num_texgens = s.bp[0x00] & 0xF;
-        const bool trace = tracing_frame();
+        const bool trace_stderr = tracing_frame();
+        const bool trace_diag = diag::g_trigger.capturing();
+        const bool trace = trace_stderr || trace_diag;
         static int trace_n = 0;
         // Several frames can be traced one after the other (the script command `trace-frame` repeated): the draws are
-        // numbered from 1 in each, and trace_ordinal counts the traced frames (0 for the first).
-        static uint64_t trace_last_frame = ~uint64_t(0);
+        // numbered from 1 in each, and trace_ordinal counts the traced frames (0 for the first). A diagnostic bundle
+        // numbers its draws the same way but does not take part in the count of traced frames.
+        static uint64_t trace_last_frame = ~uint64_t(0), ordinal_last_frame = ~uint64_t(0);
         static int trace_ordinal = -1;
+        static std::string last_state;  // the state dump of the previous draw of a bundle: repeated dumps are not written
+        static int last_state_draw = 0;
         if (trace && g_frames != trace_last_frame) {
             trace_last_frame = g_frames;
-            ++trace_ordinal;
             trace_n = 0;
+            last_state.clear();
+        }
+        if (trace_stderr && g_frames != ordinal_last_frame) {
+            ordinal_last_frame = g_frames;
+            ++trace_ordinal;
         }
         if (trace) {
             ++trace_n;
             // GP_TRACE_STATE=n[,m...]: full TEV / texture / raster state at those draws of the traced frame.
-            if (const char* list = std::getenv("GP_TRACE_STATE")) {
-                for (const char* q = list; *q;) {
-                    char* end;
-                    const long n = std::strtol(q, &end, 10);
-                    if (n == trace_n) dump_state();
-                    q = *end ? end + 1 : end;
+            if (trace_stderr) {
+                if (const char* list = std::getenv("GP_TRACE_STATE")) {
+                    for (const char* q = list; *q;) {
+                        char* end;
+                        const long n = std::strtol(q, &end, 10);
+                        if (n == trace_n) dump_state();
+                        q = *end ? end + 1 : end;
+                    }
                 }
             }
-            std::fprintf(stderr,
-                         "[DRAW] #%d prim=%u n=%u vsize=%u vcd=%06X/%04X gen=%06X tev=%u z=%02X blend=%04X acmp=%06X cc0=%06X ca0=%06X tref0=%06X img0=%06X/%06X ntexg=%u proj=%g %g %g %g %g %g o=%u vp=%g %g %g %g\n",
-                         trace_n, unsigned(prim), count, l.size, s.vcd_lo, s.vcd_hi, s.bp[0], ((s.bp[0] >> 10) & 0xF) + 1, s.bp[0x40], s.bp[0x41], s.bp[0xF3],
-                         s.bp[0xC0], s.bp[0xC1], s.bp[0x28], s.bp[0x88], s.bp[0x94], num_texgens, p0, p1, p2, p3, p4, p5, ortho, s.xf_float(0x101A),
-                         s.xf_float(0x101B), s.xf_float(0x101D), s.xf_float(0x101E));
+            trace_emit(trace_stderr, trace_diag,
+                       "[DRAW] #%d prim=%u n=%u vsize=%u vcd=%06X/%04X gen=%06X tev=%u z=%02X blend=%04X acmp=%06X cc0=%06X ca0=%06X tref0=%06X img0=%06X/%06X ntexg=%u proj=%g %g %g %g %g %g o=%u vp=%g %g %g %g\n",
+                       trace_n, unsigned(prim), count, l.size, s.vcd_lo, s.vcd_hi, s.bp[0], ((s.bp[0] >> 10) & 0xF) + 1, s.bp[0x40], s.bp[0x41], s.bp[0xF3],
+                       s.bp[0xC0], s.bp[0xC1], s.bp[0x28], s.bp[0x88], s.bp[0x94], num_texgens, p0, p1, p2, p3, p4, p5, ortho, s.xf_float(0x101A),
+                       s.xf_float(0x101B), s.xf_float(0x101D), s.xf_float(0x101E));
+            if (trace_diag) {
+                diag::Bundle& b = diag::g_bundle;
+                b.count("draws");
+                b.count("vertices", count);
+                static const char* const kPrimitive[8] = {"draws: quads", "draws: 1?", "draws: triangles", "draws: triangle strips", "draws: triangle fans", "draws: lines",
+                                                          "draws: line strips", "draws: points"};
+                b.count(kPrimitive[unsigned(prim) & 7]);
+                diag::note_draw_features(b, s.bp, s.xf);
+                // Every draw is followed by the state it ran with, written in full when it differs from the previous draw's.
+                std::string state = state_text();
+                if (state != last_state) {
+                    b.trace += "[DRAW] state of draw #" + std::to_string(trace_n) + ":\n" + state;
+                    last_state = std::move(state);
+                    last_state_draw = trace_n;
+                } else {
+                    b.trace += "[DRAW] state of draw #" + std::to_string(trace_n) + " = state of draw #" + std::to_string(last_state_draw) + "\n";
+                }
+            }
             // GP_TRACE_BT=first-last (or `ortho`): the guest call chain that fed those draws, as `[bt] #N bt: ...`
             // lines for tools/guest-watch.py (which guest code draws the fade quad, the HUD...).
             static int bt_first = -1, bt_last = -1;
@@ -573,7 +712,7 @@ private:
                 return true;
             }();
             (void)bt_parsed;
-            if ((trace_n >= bt_first && trace_n <= bt_last) || (bt_ortho && ortho)) {
+            if (trace_stderr && ((trace_n >= bt_first && trace_n <= bt_last) || (bt_ortho && ortho))) {
                 std::fprintf(stderr, "[bt] #%d", trace_n);
                 print_call_chain(stderr);
                 std::fprintf(stderr, "\n");
@@ -700,12 +839,12 @@ private:
                 }
             }
             if (trace && trace_n <= 60 && v == 0) {
-                std::fprintf(stderr, "[DRAW]   ndc=(%g %g %g) w=%g lit0=(%g %g %g %g) nrm=(%g %g %g) view_nrm=(%g %g %g) ctrl0=%X ctrl1=%X amb0=%08X mat0=%08X L0col=%08X L1col=%08X L0pos=(%g %g %g) L0dir=(%g %g %g) vcol=(%g %g %g %g)\n",
-                             cx / cw, cy / cw, zgc, cw, shaded[0][0], shaded[0][1], shaded[0][2], shaded[0][3], nrm[0], nrm[1], nrm[2], view_nrm[0], view_nrm[1], view_nrm[2], s.xf[0x100E], s.xf[0x1010],
-                             s.xf[0x100A], s.xf[0x100C], s.xf[0x603 + 0], s.xf[0x603 + 16], s.xf_float(0x60A), s.xf_float(0x60B), s.xf_float(0x60C),
-                             s.xf_float(0x60D), s.xf_float(0x60E), s.xf_float(0x60F), color[0][0], color[0][1], color[0][2], color[0][3]);
+                trace_emit(trace_stderr, trace_diag, "[DRAW]   ndc=(%g %g %g) w=%g lit0=(%g %g %g %g) nrm=(%g %g %g) view_nrm=(%g %g %g) ctrl0=%X ctrl1=%X amb0=%08X mat0=%08X L0col=%08X L1col=%08X L0pos=(%g %g %g) L0dir=(%g %g %g) vcol=(%g %g %g %g)\n",
+                           cx / cw, cy / cw, zgc, cw, shaded[0][0], shaded[0][1], shaded[0][2], shaded[0][3], nrm[0], nrm[1], nrm[2], view_nrm[0], view_nrm[1], view_nrm[2], s.xf[0x100E], s.xf[0x1010],
+                           s.xf[0x100A], s.xf[0x100C], s.xf[0x603 + 0], s.xf[0x603 + 16], s.xf_float(0x60A), s.xf_float(0x60B), s.xf_float(0x60C),
+                           s.xf_float(0x60D), s.xf_float(0x60E), s.xf_float(0x60F), color[0][0], color[0][1], color[0][2], color[0][3]);
             }
-            if (trace) {
+            if (trace_stderr) {
                 // GP_TRACE_VERTS=first-last: every vertex of those draws of the traced frame (position, vertex
                 // colour 0, lit channel 0, first texture coordinates).
                 static int verts_first = -1, verts_last = -1;
@@ -722,10 +861,15 @@ private:
                     std::fprintf(stderr, "[VERT] #%d v%u pos=(%g %g %g) col0=(%g %g %g %g) lit0=(%g %g %g %g) st0=(%g %g)\n", trace_n, v, pos[0], pos[1], pos[2],
                                  color[0][0], color[0][1], color[0][2], color[0][3], shaded[0][0], shaded[0][1], shaded[0][2], shaded[0][3], st[0][0], st[0][1]);
             }
+            // A bundle keeps the vertices of small draws (the quads of screen-space passes and 2D overlays): where they land
+            // (normalised device coordinates), their colour and texture coordinates.
+            if (trace_diag && count <= 8)
+                trace_emit(false, true, "[VERT] #%d v%u pos=(%g %g %g) ndc=(%g %g %g) col0=(%g %g %g %g) lit0=(%g %g %g %g) st0=(%g %g)\n", trace_n, v, pos[0], pos[1], pos[2],
+                           cx / cw, cy / cw, zgc, color[0][0], color[0][1], color[0][2], color[0][3], shaded[0][0], shaded[0][1], shaded[0][2], shaded[0][3], st[0][0], st[0][1]);
             if (trace && trace_n <= 3 && v < 4) {
-                std::fprintf(stderr, "[DRAW]   v%u mtx=%u pos=(%g %g %g) view=(%g %g %g) clip=(%g %g %g %g) rows:", v, pos_mtx, pos[0], pos[1], pos[2], view[0], view[1], view[2], cx, cy, cz, cw);
-                for (int r = 0; r < 12; ++r) std::fprintf(stderr, " %g", s.xf_float(m + r));
-                std::fprintf(stderr, "\n");
+                trace_emit(trace_stderr, trace_diag, "[DRAW]   v%u mtx=%u pos=(%g %g %g) view=(%g %g %g) clip=(%g %g %g %g) rows: %g %g %g %g %g %g %g %g %g %g %g %g\n", v, pos_mtx, pos[0], pos[1], pos[2],
+                           view[0], view[1], view[2], cx, cy, cz, cw, s.xf_float(m), s.xf_float(m + 1), s.xf_float(m + 2), s.xf_float(m + 3), s.xf_float(m + 4), s.xf_float(m + 5),
+                           s.xf_float(m + 6), s.xf_float(m + 7), s.xf_float(m + 8), s.xf_float(m + 9), s.xf_float(m + 10), s.xf_float(m + 11));
             }
             out[0] = cx;
             out[1] = cy;
@@ -759,15 +903,15 @@ private:
                 uv[1] = res[1];
                 uv[2] = projective ? res[2] : 1.0f;
                 if (trace && trace_n <= 40 && v < 3 && i == 0)
-                    std::fprintf(stderr, "[DRAW]   uv0 v%u=(%g %g %g) texgen0=%05X mtx=%u rows %g %g %g %g / %g %g %g %g\n", v, uv[0], uv[1], uv[2], info,
-                                 tex_mtx[0], s.xf_float(tm), s.xf_float(tm + 1), s.xf_float(tm + 2), s.xf_float(tm + 3), s.xf_float(tm + 4),
-                                 s.xf_float(tm + 5), s.xf_float(tm + 6), s.xf_float(tm + 7));
+                    trace_emit(trace_stderr, trace_diag, "[DRAW]   uv0 v%u=(%g %g %g) texgen0=%05X mtx=%u rows %g %g %g %g / %g %g %g %g\n", v, uv[0], uv[1], uv[2], info,
+                               tex_mtx[0], s.xf_float(tm), s.xf_float(tm + 1), s.xf_float(tm + 2), s.xf_float(tm + 3), s.xf_float(tm + 4),
+                               s.xf_float(tm + 5), s.xf_float(tm + 6), s.xf_float(tm + 7));
             }
         }
         // GP_TRACE_DRAWS=first-last[,first-last...]: in the traced frame, only draws numbered first..last (as printed) are
         // rendered, to see what a group of draws contributes. With several ranges, the k-th traced frame (script command
         // `trace-frame` repeated, one `shot` after each) renders the k-th range: one run shows several groups of draws.
-        if (trace) {
+        if (trace_stderr) {
             struct Range { unsigned lo, hi; };
             static const std::vector<Range> ranges = [] {
                 std::vector<Range> v;

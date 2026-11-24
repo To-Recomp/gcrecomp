@@ -85,6 +85,9 @@ PadState keyboard_to_pad(const KeyMap& map, const bool* keys, int count);
 // True when nothing is pressed or deflected (used to decide when a device starts being "used").
 bool is_neutral(const PadState& p);
 
+// Keys the host program keeps for itself: the diagnostic hotkey (F10, docs/DEBUGGING.md). A keyboard map cannot bind them.
+bool is_reserved_key(int scancode);
+
 // ---- Ports ----------------------------------------------------------------------------------
 
 // Hands out the four ports in the order devices are first used. Device ids are arbitrary non-zero.
