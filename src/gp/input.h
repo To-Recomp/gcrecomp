@@ -35,20 +35,21 @@ constexpr int kStickDeadZone = 4096;
 struct GamepadSnapshot {
     bool south = false, east = false, west = false, north = false;
     bool start = false, left_shoulder = false, right_shoulder = false;
+    bool back = false, guide = false, left_stick_click = false, right_stick_click = false;
     bool dpad_up = false, dpad_down = false, dpad_left = false, dpad_right = false;
     int16_t left_x = 0, left_y = 0, right_x = 0, right_y = 0;
     int16_t left_trigger = 0, right_trigger = 0;
 };
 
 // SDL stick (x right, y down, -32768..32767) -> SDK stick (x right, y up, -128..127) with a radial
-// dead zone that is rescaled so the output still reaches the extremes.
-void scale_stick(int16_t sdl_x, int16_t sdl_y, int8_t& x, int8_t& y);
+// dead zone (in SDL units) that is rescaled so the output still reaches the extremes.
+void scale_stick(int16_t sdl_x, int16_t sdl_y, int8_t& x, int8_t& y, int dead_zone = kStickDeadZone);
 // SDL trigger 0..32767 -> 0..255.
 uint8_t scale_trigger(int16_t sdl);
 
-// Layout: south = A, west = B, east = X, north = Y (the GameCube's physical arrangement), start =
-// Start, right shoulder = Z, analog triggers = L/R (the digital bit is set past kTriggerClick), left
-// shoulder = L at full travel.
+// The default layout (default_padmap()): south = A, west = B, east = X, north = Y (the GameCube's physical
+// arrangement), start = Start, right shoulder = Z, analog triggers = L/R (the digital bit is set past
+// kTriggerClick), left shoulder = L at full travel.
 PadState gamepad_to_pad(const GamepadSnapshot& g);
 
 // ---- Keyboard -------------------------------------------------------------------------------
@@ -61,8 +62,34 @@ enum Control {
     kControlCount,
 };
 
-// Key names accepted in the TOML file, indexed by Control: "a", "dpad_up", "cstick_left", ...
+// Names used in the TOML file, indexed by Control: "a", "dpad_up", "cstick_left", ...
 const char* control_name(Control c);
+
+// ---- Gamepad bindings -----------------------------------------------------------------------
+
+// What a control can be bound to. Positions are named as on an Xbox pad (the launcher's vocabulary): A is the
+// south button, B east, X west, Y north. Sticks and the D-pad are four directions each.
+enum GamepadInput : uint8_t {
+    kGpA, kGpB, kGpX, kGpY, kGpLB, kGpRB, kGpLT, kGpRT, kGpStart, kGpBack, kGpGuide, kGpL3, kGpR3,
+    kGpDpadUp, kGpDpadDown, kGpDpadLeft, kGpDpadRight,
+    kGpLeftStickUp, kGpLeftStickDown, kGpLeftStickLeft, kGpLeftStickRight,
+    kGpRightStickUp, kGpRightStickDown, kGpRightStickLeft, kGpRightStickRight,
+    kGpCount,
+};
+const char* gamepad_input_name(GamepadInput in);
+// Accepts the names above and "Cross", "Circle", "Square", "Triangle" (A, B, X, Y).
+bool parse_gamepad_input(const std::string& name, GamepadInput& out);
+// 0..32767: how far the input is pressed or deflected in `g`.
+int gamepad_value(GamepadInput in, const GamepadSnapshot& g);
+
+struct PadMap {
+    std::vector<GamepadInput> inputs[kControlCount];
+};
+// The layout described at gamepad_to_pad; L also takes LB, the sticks take the sticks, the D-pad the D-pad.
+PadMap default_padmap();
+// A control with several inputs takes the strongest. Buttons count as pressed from half travel; a stick direction
+// bound to a button is a full deflection.
+PadState gamepad_to_pad(const GamepadSnapshot& g, const PadMap& map, int dead_zone);
 
 // Scancodes (SDL_Scancode values) bound to each control.
 struct KeyMap {
@@ -73,10 +100,14 @@ struct KeyMap {
 // W = Z, Q = L, E = R.
 KeyMap default_keymap();
 
-// Applies a TOML text over `map`. Supported subset: `#` comments, a `[keyboard]` table, and
-// `name = "Key"` or `name = ["Key", "Key"]` where Key is an SDL key name ("Return", "Left", "A",
-// "Keypad 4", ...). Controls that are not mentioned keep their binding; `name = []` unbinds.
-// Returns false and fills `error` ("line N: ...") on the first problem; `map` is then untouched.
+// Applies the bindings of input.toml over `keys` and `pads`: `#` comments, the top-level `glyphs` and
+// `stick_deadzone` (read by settings.h, ignored here), a `[keyboard]` and a `[gamepad]` table, and in them
+// `name = "Key"`, `name = "Key|Key"` (what the launcher writes) or `name = ["Key", "Key"]`; Key is an SDL key name
+// ("Return", "Left", "A", "Keypad 4", ...) in `[keyboard]` and a GamepadInput name in `[gamepad]`. Controls that are
+// not mentioned keep their binding; `name = []` and `name = ""` unbind. Returns false and fills `error`
+// ("line N: ...") on the first problem; `keys` and `pads` are then untouched.
+bool parse_bindings(const std::string& toml, KeyMap& keys, PadMap& pads, std::string& error);
+// parse_bindings without the gamepad part (it must still be valid).
 bool parse_keymap(const std::string& toml, KeyMap& map, std::string& error);
 
 // Keyboard state (SDL scancode-indexed, `count` entries) -> controller. Keyboard sticks deflect to 80.
@@ -85,7 +116,8 @@ PadState keyboard_to_pad(const KeyMap& map, const bool* keys, int count);
 // True when nothing is pressed or deflected (used to decide when a device starts being "used").
 bool is_neutral(const PadState& p);
 
-// Keys the host program keeps for itself: the diagnostic hotkey (F10, docs/DEBUGGING.md). A keyboard map cannot bind them.
+// Keys the host program keeps for itself: F10, the diagnostic hotkey (docs/DEBUGGING.md), and F1, the settings overlay.
+// A keyboard map cannot bind them.
 bool is_reserved_key(int scancode);
 
 // ---- Ports ----------------------------------------------------------------------------------

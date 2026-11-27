@@ -80,6 +80,9 @@ void copy_efb(const CopyRequest& request, const State& state);
 // The game synchronised with the GPU (draw-sync token, draw done): copies kept on the GPU are written to guest memory.
 void flush_copies();
 bool pump_events();
+// Hands the window layer the player's settings: the overlay starts, and fullscreen, vsync, picture shape, volume,
+// audio device and stick dead zone follow them from now on.
+void attach_settings(settings::Store& store, const char* manifest);
 }  // namespace renderer
 
 }  // namespace gcrecomp::gp

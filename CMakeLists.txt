@@ -17,6 +17,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 #   gcrecomp_gx         — GX graphics (TEV, textures, D3D11 backend)
 #   gcrecomp_audio      — DSP ADPCM decoder, voice mixer
 #   gcrecomp_input      — Controller input (keyboard, XInput)
+#   (overlay)           — the settings overlay is the separate To-Recomp/overlay project, found next to this checkout
 #   gcrecomp_recompiler — PPC → C static recompiler tool (when available)
 # =============================================================================
 
@@ -29,6 +30,7 @@ option(GCRECOMP_BUILD_TOOLS "Build recompiler tools" ON)
 option(GCRECOMP_BUILD_RUNTIME "Build the game runtime libraries" ON)
 option(GCRECOMP_BUILD_EXAMPLE "Build the example launcher" ON)
 option(GCRECOMP_FETCH_SDL3 "Download and build SDL3 with FetchContent instead of using an installed one" OFF)
+option(GCRECOMP_OVERLAY "Build with the settings overlay (the To-Recomp/overlay checkout at GCRECOMP_OVERLAY_DIR)" ON)
 # Unit tests (CTest): on when gcrecomp is the top-level project, off when it is added as a subdirectory.
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     option(GCRECOMP_BUILD_TESTS "Build the unit tests" ON)
@@ -172,6 +174,8 @@ if(GCRECOMP_BUILD_RUNTIME)
             src/gp/gp_decode.cpp
             src/gp/diag.cpp
             src/gp/gp_record.cpp
+            src/settings/settings.cpp
+            src/settings/toml_edit.cpp
         )
         target_include_directories(gcrecomp_gp PUBLIC include)
         # Replays a GP stream recording (GP_RECORD) without the game: tools/gp_replay.cpp.
@@ -180,6 +184,26 @@ if(GCRECOMP_BUILD_RUNTIME)
         target_link_libraries(gp_replay PRIVATE gcrecomp_gp gcrecomp_runtime)
         # The texture decoders live in gcrecomp_gx.
         target_link_libraries(gcrecomp_gp PUBLIC gcrecomp_gx gcrecomp_sdl3)
+
+        # The settings overlay is the To-Recomp/overlay project: console-agnostic, it reads the game's recomplauncher.json
+        # to know what to show and edit. It is found next to this checkout (or at GCRECOMP_OVERLAY_DIR) and built with the
+        # SDL3 found above; without it the runtime builds with no overlay (GCRECOMP_NO_OVERLAY).
+        set(GCRECOMP_OVERLAY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../overlay" CACHE PATH "Path to the To-Recomp/overlay checkout")
+        if(GCRECOMP_OVERLAY AND EXISTS ${GCRECOMP_OVERLAY_DIR}/CMakeLists.txt)
+            if(NOT TARGET torecomp_sdl3)
+                add_library(torecomp_sdl3 ALIAS gcrecomp_sdl3)
+            endif()
+            set(TOREC_OVERLAY_TESTS OFF CACHE BOOL "" FORCE)
+            set(TOREC_OVERLAY_UI ON CACHE BOOL "" FORCE)
+            add_subdirectory(${GCRECOMP_OVERLAY_DIR} overlay EXCLUDE_FROM_ALL)
+            target_sources(gcrecomp_gp PRIVATE src/gp/overlay_host.cpp)
+            target_link_libraries(gcrecomp_gp PUBLIC torecomp_overlay gcrecomp_audio)
+        else()
+            if(GCRECOMP_OVERLAY)
+                message(STATUS "No overlay at ${GCRECOMP_OVERLAY_DIR}: building without the settings overlay")
+            endif()
+            target_compile_definitions(gcrecomp_gp PUBLIC GCRECOMP_NO_OVERLAY)
+        endif()
         if(GCRECOMP_BUILD_TESTS)
             enable_testing()
             add_executable(gcrecomp_input_tests tests/input_tests.cpp)
@@ -219,6 +243,9 @@ if(BUILD_TESTING)
     add_executable(diag_test tests/diag_test.cpp src/gp/diag.cpp src/gp/efb_copy.cpp src/gp/gp_decode.cpp src/gx/gx_texture.cpp)
     target_include_directories(diag_test PRIVATE include src/gp)
     add_test(NAME diag COMMAND diag_test)
+    add_executable(settings_test tests/settings_test.cpp src/settings/settings.cpp src/settings/toml_edit.cpp)
+    target_include_directories(settings_test PRIVATE include src/settings)
+    add_test(NAME settings COMMAND settings_test)
 endif()
 
 # ===========================================================================

@@ -118,6 +118,9 @@ target_link_libraries(my_game PRIVATE gcrecomp_runtime gcrecomp_gx gcrecomp_audi
 
 See the [docs/](docs/) folder for detailed guides on each phase of bringing up a new game.
 
+The in-game F1 settings menu is the separate [To-Recomp/overlay](https://github.com/To-Recomp/overlay) project, driven by the
+game's `recomplauncher.json`; what this runtime reads and wires is in [docs/SETTINGS.md](docs/SETTINGS.md).
+
 ## Components
 
 ### Recompiler Tool (`tools/recompiler/`)

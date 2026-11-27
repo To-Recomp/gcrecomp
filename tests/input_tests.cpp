@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "gcrecomp/runtime.h"
+#include "gcrecomp/gp/bindings.h"
 #include "input.h"
 
 namespace gcrecomp {
@@ -191,6 +192,99 @@ static void test_keymap_toml() {
     CHECK(parse_keymap("[keyboard]\r\na = \"J\"\r\n", m, err));  // CRLF
 }
 
+static void test_gamepad_remap() {
+    // Default map = the fixed layout of before: the generic path and gamepad_to_pad(g) agree.
+    GamepadSnapshot g;
+    g.south = g.dpad_up = true;
+    g.left_x = -20000;
+    g.right_trigger = 30000;
+    CHECK(gamepad_to_pad(g, default_padmap(), kStickDeadZone).buttons == gamepad_to_pad(g).buttons);
+
+    // A button on another control, a trigger on a button, a stick direction on a button.
+    PadMap m = default_padmap();
+    m.inputs[kCtlB] = {kGpA};       // south now gives B
+    m.inputs[kCtlA] = {kGpLT};      // the left trigger gives A once it is half pressed
+    m.inputs[kCtlStickRight] = {kGpX};  // west button = stick right, full deflection
+    GamepadSnapshot s;
+    s.south = true;
+    PadState p = gamepad_to_pad(s, m, kStickDeadZone);
+    CHECK(p.buttons == kB);
+    s = {};
+    s.left_trigger = 10000;
+    CHECK(gamepad_to_pad(s, m, kStickDeadZone).buttons == 0 && gamepad_to_pad(s, m, kStickDeadZone).trigger_l == scale_trigger(10000));
+    s.left_trigger = 20000;
+    CHECK((gamepad_to_pad(s, m, kStickDeadZone).buttons & kA) != 0);
+    s = {};
+    s.west = true;
+    p = gamepad_to_pad(s, m, kStickDeadZone);
+    CHECK(p.stick_x == 127 && p.stick_y == 0 && p.buttons == 0);
+    s.left_x = -32768;  // both directions of one axis: they cancel
+    CHECK(gamepad_to_pad(s, m, kStickDeadZone).stick_x == 0);
+    // Unbound control: nothing happens.
+    m.inputs[kCtlStart].clear();
+    s = {};
+    s.start = true;
+    CHECK(gamepad_to_pad(s, m, kStickDeadZone).buttons == 0);
+
+    // The dead zone is a parameter: a deflection inside a wide one reads as centred.
+    int8_t x, y;
+    scale_stick(8000, 0, x, y, 4096);
+    CHECK(x > 0);
+    scale_stick(8000, 0, x, y, 12000);
+    CHECK(x == 0 && y == 0);
+    scale_stick(32767, 0, x, y, 12000);  // still reaches the extreme
+    CHECK(x == 127);
+
+    GamepadInput in;
+    CHECK(parse_gamepad_input("Cross", in) && in == kGpA);
+    CHECK(parse_gamepad_input("Triangle", in) && in == kGpY);
+    CHECK(parse_gamepad_input("D-pad Left", in) && in == kGpDpadLeft);
+    CHECK(!parse_gamepad_input("a", in) && !parse_gamepad_input("", in));
+    for (int i = 0; i < kGpCount; ++i) {  // every name reads back to its input
+        GamepadInput back;
+        CHECK(parse_gamepad_input(gamepad_input_name(GamepadInput(i)), back) && back == GamepadInput(i));
+    }
+}
+
+static void test_bindings_file() {
+    KeyMap keys = default_keymap();
+    PadMap pads = default_padmap();
+    std::string err;
+    const char* file =
+        "glyphs = \"Xbox\"\n"
+        "stick_deadzone = 0.2  # not ours\n"
+        "[keyboard]\n"
+        "a = \"J|K\"\n"        // the launcher's way to write two keys
+        "b = \"\"\n"           // and an empty list
+        "x = [\"Keypad 4\"]\n"
+        "[gamepad]\n"
+        "a = \"B|Cross\"\n"
+        "start = \"Back\"\n"
+        "l = []\n"
+        "stick_up = \"Right Stick Up\"\n";
+    CHECK(parse_bindings(file, keys, pads, err));
+    CHECK((keys.keys[kCtlA] == std::vector<int>{SDL_SCANCODE_J, SDL_SCANCODE_K}));
+    CHECK(keys.keys[kCtlB].empty());
+    CHECK(keys.keys[kCtlX] == std::vector<int>{SDL_SCANCODE_KP_4});
+    CHECK((pads.inputs[kCtlA] == std::vector<GamepadInput>{kGpB, kGpA}));
+    CHECK(pads.inputs[kCtlStart] == std::vector<GamepadInput>{kGpBack});
+    CHECK(pads.inputs[kCtlL].empty());
+    CHECK(pads.inputs[kCtlStickUp] == std::vector<GamepadInput>{kGpRightStickUp});
+    CHECK(pads.inputs[kCtlZ] == default_padmap().inputs[kCtlZ]);  // not mentioned: default
+
+    // Errors name the line and leave both maps as they were.
+    const KeyMap keys_before = keys;
+    const PadMap pads_before = pads;
+    CHECK(!parse_bindings("[gamepad]\na = \"A\"\nb = \"Turbo\"\n", keys, pads, err) && err.rfind("line 3", 0) == 0);
+    CHECK(!parse_bindings("[gamepad]\na = \"Guide\"\n", keys, pads, err) && err.find("overlay") != std::string::npos);
+    CHECK(!parse_bindings("[keyboard]\na = \"F1\"\n", keys, pads, err) && err.find("overlay") != std::string::npos);
+    CHECK(!parse_bindings("[keyboard]\na = \"F10\"\n", keys, pads, err) && err.find("diagnostic") != std::string::npos);
+    CHECK(!parse_bindings("turbo = 1\n", keys, pads, err) && err.rfind("line 1", 0) == 0);
+    CHECK(!parse_bindings("[gamepad]\nturbo = \"A\"\n", keys, pads, err));
+    CHECK(keys.keys[kCtlA] == keys_before.keys[kCtlA] && pads.inputs[kCtlA] == pads_before.inputs[kCtlA]);
+    CHECK(is_reserved_key(SDL_SCANCODE_F1) && is_reserved_key(SDL_SCANCODE_F10));
+}
+
 static void test_port_assignment() {
     PortAssigner ports;
     CHECK(ports.port_for(10, false) == -1);  // idle, unassigned devices take no port
@@ -289,6 +383,8 @@ static void test_pad_replacements() {
 
 int main() {
     test_stick_scaling();
+    test_gamepad_remap();
+    test_bindings_file();
     test_trigger_scaling();
     test_gamepad_layout();
     test_keyboard_defaults();

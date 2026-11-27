@@ -1,32 +1,35 @@
 // SPDX-License-Identifier: MIT
 #include "input.h"
 
+#include "gcrecomp/gp/bindings.h"
 #include "gcrecomp/gp/gp.h"
 #include "diag.h"
 
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 
 namespace gcrecomp::gp::input {
 
 // ---- Scaling and gamepad layout -----------------------------------------------------------------
 
-void scale_stick(int16_t sdl_x, int16_t sdl_y, int8_t& x, int8_t& y) {
+void scale_stick(int16_t sdl_x, int16_t sdl_y, int8_t& x, int8_t& y, int dead_zone) {
     const double fx = sdl_x, fy = -double(sdl_y);  // SDL's y grows downwards, the SDK's upwards
     const double mag = std::hypot(fx, fy);
-    if (mag <= kStickDeadZone) {
+    if (mag <= dead_zone) {
         x = y = 0;
         return;
     }
-    const double k = std::min(1.0, (mag - kStickDeadZone) / (32767.0 - kStickDeadZone)) / mag;
+    const double k = std::min(1.0, (mag - dead_zone) / (32767.0 - dead_zone)) / mag;
     auto to_i8 = [](double v) { return int8_t(std::clamp(std::lround(v >= 0 ? v * 127.0 : v * 128.0), -128L, 127L)); };
     x = to_i8(fx * k);
     y = to_i8(fy * k);
@@ -37,28 +40,135 @@ uint8_t scale_trigger(int16_t sdl) {
     return uint8_t((int(sdl) * 255 + 16383) / 32767);
 }
 
-PadState gamepad_to_pad(const GamepadSnapshot& g) {
+namespace {
+
+const char* const kGamepadInputNames[kGpCount] = {
+    "A", "B", "X", "Y", "LB", "RB", "LT", "RT", "Start", "Back", "Guide", "L3", "R3",
+    "D-pad Up", "D-pad Down", "D-pad Left", "D-pad Right",
+    "Left Stick Up", "Left Stick Down", "Left Stick Left", "Left Stick Right",
+    "Right Stick Up", "Right Stick Down", "Right Stick Left", "Right Stick Right",
+};
+
+// Stick axes in SDL units: how far past the centre in one direction, 0..32767.
+int axis_part(int v) { return v > 0 ? std::min(v, 32767) : 0; }
+
+}  // namespace
+
+const char* gamepad_input_name(GamepadInput in) { return kGamepadInputNames[in]; }
+
+bool parse_gamepad_input(const std::string& name, GamepadInput& out) {
+    static const struct { const char* alias; GamepadInput input; } kAliases[] = {
+        {"Cross", kGpA}, {"Circle", kGpB}, {"Square", kGpX}, {"Triangle", kGpY},
+    };
+    for (int i = 0; i < kGpCount; ++i) {
+        if (name == kGamepadInputNames[i]) {
+            out = GamepadInput(i);
+            return true;
+        }
+    }
+    for (const auto& a : kAliases) {
+        if (name == a.alias) {
+            out = a.input;
+            return true;
+        }
+    }
+    return false;
+}
+
+int gamepad_value(GamepadInput in, const GamepadSnapshot& g) {
+    auto digital = [](bool b) { return b ? 32767 : 0; };
+    switch (in) {
+        case kGpA: return digital(g.south);
+        case kGpB: return digital(g.east);
+        case kGpX: return digital(g.west);
+        case kGpY: return digital(g.north);
+        case kGpLB: return digital(g.left_shoulder);
+        case kGpRB: return digital(g.right_shoulder);
+        case kGpLT: return axis_part(g.left_trigger);
+        case kGpRT: return axis_part(g.right_trigger);
+        case kGpStart: return digital(g.start);
+        case kGpBack: return digital(g.back);
+        case kGpGuide: return digital(g.guide);
+        case kGpL3: return digital(g.left_stick_click);
+        case kGpR3: return digital(g.right_stick_click);
+        case kGpDpadUp: return digital(g.dpad_up);
+        case kGpDpadDown: return digital(g.dpad_down);
+        case kGpDpadLeft: return digital(g.dpad_left);
+        case kGpDpadRight: return digital(g.dpad_right);
+        case kGpLeftStickUp: return axis_part(-int(g.left_y));
+        case kGpLeftStickDown: return axis_part(g.left_y);
+        case kGpLeftStickLeft: return axis_part(-int(g.left_x));
+        case kGpLeftStickRight: return axis_part(g.left_x);
+        case kGpRightStickUp: return axis_part(-int(g.right_y));
+        case kGpRightStickDown: return axis_part(g.right_y);
+        case kGpRightStickLeft: return axis_part(-int(g.right_x));
+        case kGpRightStickRight: return axis_part(g.right_x);
+        case kGpCount: break;
+    }
+    return 0;
+}
+
+PadMap default_padmap() {
+    PadMap m;
+    m.inputs[kCtlA] = {kGpA};  // south
+    m.inputs[kCtlB] = {kGpX};  // west
+    m.inputs[kCtlX] = {kGpB};  // east
+    m.inputs[kCtlY] = {kGpY};  // north
+    m.inputs[kCtlStart] = {kGpStart};
+    m.inputs[kCtlZ] = {kGpRB};
+    m.inputs[kCtlL] = {kGpLT, kGpLB};
+    m.inputs[kCtlR] = {kGpRT};
+    m.inputs[kCtlDpadUp] = {kGpDpadUp};
+    m.inputs[kCtlDpadDown] = {kGpDpadDown};
+    m.inputs[kCtlDpadLeft] = {kGpDpadLeft};
+    m.inputs[kCtlDpadRight] = {kGpDpadRight};
+    m.inputs[kCtlStickUp] = {kGpLeftStickUp};
+    m.inputs[kCtlStickDown] = {kGpLeftStickDown};
+    m.inputs[kCtlStickLeft] = {kGpLeftStickLeft};
+    m.inputs[kCtlStickRight] = {kGpLeftStickRight};
+    m.inputs[kCtlCStickUp] = {kGpRightStickUp};
+    m.inputs[kCtlCStickDown] = {kGpRightStickDown};
+    m.inputs[kCtlCStickLeft] = {kGpRightStickLeft};
+    m.inputs[kCtlCStickRight] = {kGpRightStickRight};
+    return m;
+}
+
+PadState gamepad_to_pad(const GamepadSnapshot& g, const PadMap& map, int dead_zone) {
+    auto value = [&](Control c) {
+        int v = 0;
+        for (const GamepadInput in : map.inputs[c]) v = std::max(v, gamepad_value(in, g));
+        return v;
+    };
+    auto pressed = [&](Control c) { return value(c) >= 16384; };
     PadState p;
     uint16_t b = 0;
-    if (g.dpad_left) b |= kLeft;
-    if (g.dpad_right) b |= kRight;
-    if (g.dpad_down) b |= kDown;
-    if (g.dpad_up) b |= kUp;
-    if (g.south) b |= kA;
-    if (g.west) b |= kB;
-    if (g.east) b |= kX;
-    if (g.north) b |= kY;
-    if (g.start) b |= kStart;
-    if (g.right_shoulder) b |= kZ;
-    p.trigger_l = g.left_shoulder ? 255 : scale_trigger(g.left_trigger);
-    p.trigger_r = scale_trigger(g.right_trigger);
+    if (pressed(kCtlDpadLeft)) b |= kLeft;
+    if (pressed(kCtlDpadRight)) b |= kRight;
+    if (pressed(kCtlDpadDown)) b |= kDown;
+    if (pressed(kCtlDpadUp)) b |= kUp;
+    if (pressed(kCtlA)) b |= kA;
+    if (pressed(kCtlB)) b |= kB;
+    if (pressed(kCtlX)) b |= kX;
+    if (pressed(kCtlY)) b |= kY;
+    if (pressed(kCtlStart)) b |= kStart;
+    if (pressed(kCtlZ)) b |= kZ;
+    p.trigger_l = scale_trigger(int16_t(value(kCtlL)));
+    p.trigger_r = scale_trigger(int16_t(value(kCtlR)));
     if (p.trigger_l >= kTriggerClick) b |= kL;
     if (p.trigger_r >= kTriggerClick) b |= kR;
     p.buttons = b;
-    scale_stick(g.left_x, g.left_y, p.stick_x, p.stick_y);
-    scale_stick(g.right_x, g.right_y, p.substick_x, p.substick_y);
+    // Each stick is four directions: opposite ones cancel, as the keyboard's do.
+    auto stick = [&](Control up, Control down, Control left, Control right, int8_t& out_x, int8_t& out_y) {
+        const int x = std::clamp(value(right) - value(left), -32768, 32767);
+        const int y = std::clamp(value(down) - value(up), -32768, 32767);  // SDL's y grows downwards
+        scale_stick(int16_t(x), int16_t(y), out_x, out_y, dead_zone);
+    };
+    stick(kCtlStickUp, kCtlStickDown, kCtlStickLeft, kCtlStickRight, p.stick_x, p.stick_y);
+    stick(kCtlCStickUp, kCtlCStickDown, kCtlCStickLeft, kCtlCStickRight, p.substick_x, p.substick_y);
     return p;
 }
+
+PadState gamepad_to_pad(const GamepadSnapshot& g) { return gamepad_to_pad(g, default_padmap(), kStickDeadZone); }
 
 // ---- Keyboard -----------------------------------------------------------------------------------
 
@@ -174,17 +284,27 @@ bool parse_value(Cursor& c, std::vector<std::string>& out, std::string& err) {
     }
     std::string v;
     if (!parse_string(c, v, err)) return false;
-    out.push_back(v);
+    // One string may hold several names joined by '|' (the launcher's way to write a list); "" is an empty list.
+    for (size_t start = 0; start <= v.size();) {
+        const size_t bar = v.find('|', start);
+        std::string name = v.substr(start, bar == std::string::npos ? std::string::npos : bar - start);
+        name.erase(0, name.find_first_not_of(" \t"));
+        name.erase(name.find_last_not_of(" \t") + 1);
+        if (!name.empty()) out.push_back(std::move(name));
+        if (bar == std::string::npos) break;
+        start = bar + 1;
+    }
     return end_of_value(c, err);
 }
 
 }  // namespace
 
-bool parse_keymap(const std::string& toml, KeyMap& map, std::string& error) {
-    KeyMap result = map;
+bool parse_bindings(const std::string& toml, KeyMap& keys, PadMap& pads, std::string& error) {
+    KeyMap new_keys = keys;
+    PadMap new_pads = pads;
+    enum { kTop, kKeyboard, kGamepad } table = kTop;
     std::istringstream in(toml);
     std::string line;
-    bool in_keyboard = false;
     for (int n = 1; std::getline(in, line); ++n) {
         std::string err;
         auto fail = [&](const std::string& what) {
@@ -200,17 +320,22 @@ bool parse_keymap(const std::string& toml, KeyMap& map, std::string& error) {
             std::string name = line.substr(c.i + 1, close - c.i - 1);
             name.erase(0, name.find_first_not_of(" \t"));
             name.erase(name.find_last_not_of(" \t") + 1);
-            if (name != "keyboard") return fail("unknown table [" + name + "]");
-            in_keyboard = true;
+            if (name == "keyboard") table = kKeyboard;
+            else if (name == "gamepad") table = kGamepad;
+            else return fail("unknown table [" + name + "]");
             c.i = close + 1;
             if (!end_of_value(c, err)) return fail(err);
             continue;
         }
-        if (!in_keyboard) return fail("key outside the [keyboard] table");
         const size_t eq = line.find('=', c.i);
         if (eq == std::string::npos) return fail("expected 'name = value'");
         std::string key = line.substr(c.i, eq - c.i);
         key.erase(key.find_last_not_of(" \t") + 1);
+        if (table == kTop) {
+            // glyphs and stick_deadzone belong to the settings (settings.h); anything else needs its table.
+            if (key == "glyphs" || key == "stick_deadzone") continue;
+            return fail("key '" + key + "' outside the [keyboard] or [gamepad] table");
+        }
         int control = -1;
         for (int i = 0; i < kControlCount; ++i)
             if (key == kControlNames[i]) control = i;
@@ -218,17 +343,35 @@ bool parse_keymap(const std::string& toml, KeyMap& map, std::string& error) {
         c.i = eq + 1;
         std::vector<std::string> names;
         if (!parse_value(c, names, err)) return fail(err);
-        std::vector<int> codes;
-        for (const std::string& name : names) {
-            const SDL_Scancode sc = SDL_GetScancodeFromName(name.c_str());
-            if (sc == SDL_SCANCODE_UNKNOWN) return fail("unknown key name \"" + name + "\"");
-            if (is_reserved_key(int(sc))) return fail("\"" + name + "\" is reserved for the diagnostic hotkey");
-            codes.push_back(int(sc));
+        if (table == kKeyboard) {
+            std::vector<int> codes;
+            for (const std::string& name : names) {
+                const SDL_Scancode sc = SDL_GetScancodeFromName(name.c_str());
+                if (sc == SDL_SCANCODE_UNKNOWN) return fail("unknown key name \"" + name + "\"");
+                if (is_reserved_key(int(sc)))
+                    return fail("\"" + name + "\" is reserved for the " + (sc == SDL_SCANCODE_F1 ? "settings overlay" : "diagnostic hotkey"));
+                codes.push_back(int(sc));
+            }
+            new_keys.keys[control] = std::move(codes);
+        } else {
+            std::vector<GamepadInput> inputs;
+            for (const std::string& name : names) {
+                GamepadInput input;
+                if (!parse_gamepad_input(name, input)) return fail("unknown gamepad input \"" + name + "\"");
+                if (input == kGpGuide) return fail("\"Guide\" is reserved for the settings overlay");
+                inputs.push_back(input);
+            }
+            new_pads.inputs[control] = std::move(inputs);
         }
-        result.keys[control] = std::move(codes);
     }
-    map = std::move(result);
+    keys = std::move(new_keys);
+    pads = std::move(new_pads);
     return true;
+}
+
+bool parse_keymap(const std::string& toml, KeyMap& map, std::string& error) {
+    PadMap scratch = default_padmap();
+    return parse_bindings(toml, map, scratch, error);
 }
 
 PadState keyboard_to_pad(const KeyMap& map, const bool* keys, int count) {
@@ -262,7 +405,7 @@ PadState keyboard_to_pad(const KeyMap& map, const bool* keys, int count) {
     return p;
 }
 
-bool is_reserved_key(int scancode) { return scancode == SDL_SCANCODE_F10; }
+bool is_reserved_key(int scancode) { return scancode == SDL_SCANCODE_F10 || scancode == SDL_SCANCODE_F1; }
 
 bool is_neutral(const PadState& p) {
     return p.buttons == 0 && p.stick_x == 0 && p.stick_y == 0 && p.substick_x == 0 && p.substick_y == 0 &&
@@ -301,6 +444,18 @@ struct Device {
 };
 
 KeyMap g_keymap = default_keymap();
+PadMap g_padmap = default_padmap();
+std::mutex g_mutex;  // the window thread's events and frame update, and the overlay's edits, share the state below
+std::string g_input_path;
+bool g_suspended = false;
+std::atomic<int> g_dead_zone{kStickDeadZone};
+bool g_overlay_request = false, g_overlay_button_down = false;
+
+// A binding being captured for the overlay (begin_capture).
+struct Capture {
+    bool active = false, keyboard = false, armed = false, ready = false;
+    std::string name;
+} g_capture;
 std::vector<Device> g_gamepads;
 PortAssigner g_ports;
 Script g_script;
@@ -321,6 +476,10 @@ GamepadSnapshot read_gamepad(SDL_Gamepad* g) {
     s.start = b(SDL_GAMEPAD_BUTTON_START);
     s.left_shoulder = b(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER);
     s.right_shoulder = b(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER);
+    s.back = b(SDL_GAMEPAD_BUTTON_BACK);
+    s.guide = b(SDL_GAMEPAD_BUTTON_GUIDE);
+    s.left_stick_click = b(SDL_GAMEPAD_BUTTON_LEFT_STICK);
+    s.right_stick_click = b(SDL_GAMEPAD_BUTTON_RIGHT_STICK);
     s.dpad_up = b(SDL_GAMEPAD_BUTTON_DPAD_UP);
     s.dpad_down = b(SDL_GAMEPAD_BUTTON_DPAD_DOWN);
     s.dpad_left = b(SDL_GAMEPAD_BUTTON_DPAD_LEFT);
@@ -398,15 +557,20 @@ uint16_t run_script() {
 }  // namespace
 
 void init(const char* toml_path) {
+    std::lock_guard<std::mutex> lock(g_mutex);
     g_keymap = default_keymap();
-    if (toml_path && *toml_path) {
-        std::ifstream f(toml_path);
+    g_padmap = default_padmap();
+    g_input_path = toml_path ? toml_path : "";
+    g_suspended = false;
+    g_capture = Capture{};
+    if (!g_input_path.empty()) {
+        std::ifstream f(g_input_path);
         if (f) {
             std::stringstream ss;
             ss << f.rdbuf();
             std::string error;
-            if (parse_keymap(ss.str(), g_keymap, error)) std::fprintf(stderr, "[input] keyboard map loaded from %s\n", toml_path);
-            else std::fprintf(stderr, "[input] %s: %s; using the default keyboard map\n", toml_path, error.c_str());
+            if (parse_bindings(ss.str(), g_keymap, g_padmap, error)) std::fprintf(stderr, "[input] bindings loaded from %s\n", g_input_path.c_str());
+            else std::fprintf(stderr, "[input] %s: %s; using the default bindings\n", g_input_path.c_str(), error.c_str());
         }
     }
     load_script();
@@ -429,7 +593,23 @@ void shutdown() {
 }
 
 void handle_event(const SDL_Event& e) {
-    if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && is_reserved_key(int(e.key.scancode))) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && g_capture.active) {
+        // The next key is the answer; Escape abandons it. F1 and F10 belong to the program and are not offered.
+        const SDL_Scancode sc = e.key.scancode;
+        if (sc == SDL_SCANCODE_ESCAPE) {
+            g_capture = Capture{};
+        } else if (g_capture.keyboard && !is_reserved_key(int(sc))) {
+            const char* name = SDL_GetScancodeName(sc);
+            if (name && *name && SDL_GetScancodeFromName(name) == sc) {  // only names that read back to the same key
+                g_capture.name = name;
+                g_capture.ready = true;
+                g_capture.active = false;
+            }
+        }
+        return;
+    }
+    if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_F10) {
         request_diag("");
     } else if (e.type == SDL_EVENT_GAMEPAD_ADDED) {
         open_gamepad(e.gdevice.which);
@@ -448,6 +628,7 @@ void handle_event(const SDL_Event& e) {
 }
 
 void update() {
+    std::lock_guard<std::mutex> lock(g_mutex);
     PadState next[4];
     auto place = [&](uint32_t device, const PadState& state) {
         const int port = g_ports.port_for(device, !is_neutral(state));
@@ -455,8 +636,37 @@ void update() {
     };
     int key_count = 0;
     const bool* keys = SDL_GetKeyboardState(&key_count);
+    const int dead_zone = g_dead_zone.load();
     place(kKeyboardDevice, keyboard_to_pad(g_keymap, keys, key_count));
-    for (const Device& d : g_gamepads) place(d.id, gamepad_to_pad(read_gamepad(d.pad)));
+    bool overlay_button = false;
+    int capture_value = 0;
+    GamepadInput capture_input = kGpA;
+    for (const Device& d : g_gamepads) {
+        const GamepadSnapshot snapshot = read_gamepad(d.pad);
+        place(d.id, gamepad_to_pad(snapshot, g_padmap, dead_zone));
+        overlay_button = overlay_button || snapshot.guide || (snapshot.back && snapshot.start);
+        if (g_capture.active && !g_capture.keyboard) {
+            for (int i = 0; i < kGpCount; ++i) {
+                const int v = i == kGpGuide ? 0 : gamepad_value(GamepadInput(i), snapshot);
+                if (v > capture_value) capture_value = v, capture_input = GamepadInput(i);
+            }
+        }
+    }
+    // Gamepad capture: wait until everything is released, then the first input pressed or deflected far enough wins.
+    if (g_capture.active && !g_capture.keyboard) {
+        if (!g_capture.armed) {
+            g_capture.armed = capture_value < 8000;
+        } else if (capture_value >= 24000) {
+            g_capture.name = gamepad_input_name(capture_input);
+            g_capture.ready = true;
+            g_capture.active = false;
+        }
+    }
+    if (overlay_button && !g_overlay_button_down) g_overlay_request = true;  // on the press, not while it is held
+    g_overlay_button_down = overlay_button;
+    if (g_suspended) {
+        for (PadState& p : next) p = PadState{};  // the overlay is open: the game sees a pad at rest
+    }
 
     ++g_frame;
     next[0].buttons |= run_script();
@@ -497,4 +707,87 @@ void notify_frame(const FrameSignature* sig) {
 
 std::vector<std::string> take_shot_requests() { return g_script.take_shots(); }
 
+// ---- Bindings file (bindings.h) -------------------------------------------------------------------
+
+namespace {
+
+bool read_input_file(const std::string& path, std::string& text) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    std::stringstream ss;
+    ss << f.rdbuf();
+    text = ss.str();
+    return true;
+}
+
+}  // namespace
+
+void reload_bindings() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    std::string text;
+    if (g_input_path.empty() || !read_input_file(g_input_path, text)) return;
+    KeyMap keys = default_keymap();
+    PadMap pads = default_padmap();
+    std::string error;
+    if (!parse_bindings(text, keys, pads, error)) {
+        std::fprintf(stderr, "[input] %s: %s; keeping the current bindings\n", g_input_path.c_str(), error.c_str());
+        return;
+    }
+    g_keymap = std::move(keys);
+    g_padmap = std::move(pads);
+}
+
+void begin_capture(bool keyboard) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_capture = Capture{};
+    g_capture.active = true;
+    g_capture.keyboard = keyboard;
+}
+
+bool capturing() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_capture.active;
+}
+
+bool poll_capture(std::string& name) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_capture.ready) return false;
+    name = std::move(g_capture.name);
+    g_capture = Capture{};
+    return true;
+}
+
+void cancel_capture() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_capture = Capture{};
+}
+
+void set_suspended(bool suspended) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_suspended = suspended;
+}
+
+bool suspended() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_suspended;
+}
+
+void set_stick_deadzone(float fraction) { g_dead_zone = int(std::lround(std::clamp(fraction, 0.0f, 0.5f) * 32767.0f)); }
+
+std::vector<std::string> connected_gamepads() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    std::vector<std::string> names;
+    for (const Device& d : g_gamepads) {
+        const char* n = SDL_GetGamepadName(d.pad);
+        names.push_back(n && *n ? n : "Gamepad");
+    }
+    return names;
+}
+
+bool take_overlay_request() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const bool requested = g_overlay_request;
+    g_overlay_request = false;
+    return requested;
+}
 }  // namespace gcrecomp::gp::input
