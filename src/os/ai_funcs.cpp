@@ -210,6 +210,8 @@ void ai_hle_reset(audio::AudioSink* sink) {
     g_ai.sink = sink;
 }
 
+audio::AudioSink* ai_hle_sink() { return g_ai.sink; }
+
 RecompiledFunc lookup_ai_func(const char* name) {
     for (const Entry* e = kTable; e->name; ++e) {
         if (std::strcmp(e->name, name) == 0) return e->func;

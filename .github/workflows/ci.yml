@@ -26,6 +26,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The settings overlay (To-Recomp/overlay) is built into the GP renderer: the same SDL3 as below, its own tests off.
+      - uses: actions/checkout@v4
+        with:
+          repository: To-Recomp/overlay
+          path: overlay-src
+
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |
@@ -41,11 +47,11 @@ jobs:
           CXX: ${{ matrix.cxx }}
         run: >
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          -DGCRECOMP_FETCH_SDL3=ON -DGCRECOMP_BUILD_TESTS=ON
+          -DGCRECOMP_FETCH_SDL3=ON -DGCRECOMP_BUILD_TESTS=ON -DGCRECOMP_OVERLAY_DIR="${{ github.workspace }}/overlay-src"
 
       - name: Configure (Windows)
         if: runner.os == 'Windows'
-        run: cmake -S . -B build -A x64 -DGCRECOMP_FETCH_SDL3=ON -DGCRECOMP_BUILD_TESTS=ON
+        run: cmake -S . -B build -A x64 -DGCRECOMP_FETCH_SDL3=ON -DGCRECOMP_BUILD_TESTS=ON -DGCRECOMP_OVERLAY_DIR="${{ github.workspace }}/overlay-src"
 
       - name: Build
         run: cmake --build build --config Release --parallel

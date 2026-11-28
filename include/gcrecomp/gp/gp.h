@@ -11,6 +11,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "gcrecomp/settings.h"
+
 namespace gcrecomp::gp {
 
 struct Config {
@@ -22,6 +24,13 @@ struct Config {
     int max_screenshots = 0;
     // TOML file with the keyboard mapping (see src/gp/input.h); null or missing = defaults.
     const char* input_config = nullptr;
+    // The instance's data folder (the launcher's `{data}`): settings.toml and input.toml are read from it (the settings
+    // overlay and the launcher edit them). Null or empty: RECOMPLAUNCHER_DATA, else nothing is read and the defaults
+    // apply. `input_config`, when set, overrides the path of input.toml.
+    const char* data_dir = nullptr;
+    // The game's recomplauncher.json: the settings overlay (To-Recomp/overlay) reads it to know what to show and edit.
+    // Null or empty: the TOREC_MANIFEST environment variable, else no overlay.
+    const char* manifest = nullptr;
 };
 
 // Creates the window and GL context and installs the write-gather pipe sink. Returns false when no
@@ -31,6 +40,9 @@ void shutdown();
 
 // A store to the write-gather pipe: `size` is 1, 2, 4 or 8 bytes, `value` holds them big-endian.
 void wgp_write(uint32_t size, uint64_t value);
+
+// The settings the window layer, the overlay and the audio output share; null before init() or without graphics.
+settings::Store* settings_store();
 
 // Processes window events. Returns false once the window was closed.
 bool pump_events();

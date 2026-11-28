@@ -31,6 +31,14 @@ public:
 
     /// Frames submitted and not played yet. The AI emulation paces itself on this value.
     virtual size_t queued_frames() = 0;
+
+    /// Linear output gain, 0..1 (1 = unchanged). Applies to what is played from now on. No-op by default.
+    virtual void set_volume(float /*gain*/) {}
+
+    /// Moves the output to the playback device called `name` (as listed by list_playback_devices()); an empty name
+    /// or one that is not there any more selects the system's default device. Queued audio is dropped. Returns false
+    /// when no device could be opened (the sink then stays closed). No-op returning true by default.
+    virtual bool set_device(const std::string& /*name*/) { return true; }
 };
 
 /// A sink that plays nothing. In manual mode (tests) frames leave the queue only through
@@ -77,5 +85,9 @@ std::unique_ptr<AudioSink> make_wav_dump_sink(std::unique_ptr<AudioSink> inner, 
 /// SDL3 sink (default playback device, SDL does the resampling to the device rate). Returns
 /// nullptr when the library was built without SDL3.
 std::unique_ptr<AudioSink> make_sdl_sink();
+
+/// Names of the playback devices the system offers right now, in the order SDL lists them (empty without SDL3 or
+/// without devices). The names are what AudioSink::set_device takes.
+std::vector<std::string> list_playback_devices();
 
 }  // namespace gcrecomp::audio

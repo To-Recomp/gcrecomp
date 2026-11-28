@@ -59,6 +59,8 @@ public:
         write_header();
     }
     size_t queued_frames() override { return inner_->queued_frames(); }
+    void set_volume(float gain) override { inner_->set_volume(gain); }
+    bool set_device(const std::string& name) override { return inner_->set_device(name); }
 
 private:
     void write_header() {

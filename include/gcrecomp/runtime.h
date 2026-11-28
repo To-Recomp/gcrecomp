@@ -610,6 +610,9 @@ void dsp_poll(PPCContext* ctx, Memory* mem);
 // choice of SDL3 or the null sink). For tests.
 namespace audio { class AudioSink; }
 void ai_hle_reset(audio::AudioSink* sink);
+// The sink the AI replacements play into (null until the game first uses the AI). For the window layer's volume and
+// device settings.
+audio::AudioSink* ai_hle_sink();
 
 // Per-function counters of calls that reached a native replacement, for diagnosing what a game is doing.
 void hle_count(const char* name);

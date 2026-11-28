@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +29,10 @@
 #include "gp_internal.h"
 #include "input.h"
 #include "diag.h"
+#include "gcrecomp/audio/audio_sink.h"
+#include "gcrecomp/gp/bindings.h"
+#include "overlay_glue.h"
+#include "gcrecomp/settings.h"
 
 namespace gcrecomp::gx {
 // Defined in src/gx/gx_texture.cpp.
@@ -44,6 +50,39 @@ SDL_Window* g_window = nullptr;
 SDL_GLContext g_context = nullptr;
 int g_window_w = 0, g_window_h = 0;
 bool g_closed = false;
+settings::Store* g_store = nullptr;
+settings::Values g_applied;                 // the settings last applied to the window and the sink
+bool g_applied_valid = false;
+audio::AudioSink* g_audio_target = nullptr;  // the sink the audio settings were last applied to
+settings::Aspect g_aspect = settings::Aspect::Stretch;  // without settings (tests, tools) the picture fills the window, as it always did
+bool g_overlay_was_visible = false;
+std::chrono::steady_clock::time_point g_last_reload = std::chrono::steady_clock::now();
+double g_fps = 0.0;  // presented frames per second, measured over half a second
+int g_fps_frames = 0;
+std::chrono::steady_clock::time_point g_fps_since = std::chrono::steady_clock::now();
+
+// Where the picture goes in the window: the largest box of the chosen shape that fits, centred, or all of the window.
+struct PresentRect {
+    int x, y, w, h;
+};
+PresentRect g_present_rect = {0, 0, 0, 0};
+
+PresentRect present_rect_for(settings::Aspect aspect, int window_w, int window_h) {
+    double shape = 0.0;  // width / height of the box; 0 = the whole window
+    switch (aspect) {
+        case settings::Aspect::Fit: shape = 4.0 / 3.0; break;
+        case settings::Aspect::Wide16x9: shape = 16.0 / 9.0; break;
+        case settings::Aspect::Wide21x9: shape = 21.0 / 9.0; break;
+        case settings::Aspect::Stretch: break;
+    }
+    if (shape == 0.0 || window_w <= 0 || window_h <= 0) return {0, 0, window_w, window_h};
+    int w = window_w, h = int(std::lround(window_w / shape));
+    if (h > window_h) {
+        h = window_h;
+        w = int(std::lround(window_h * shape));
+    }
+    return {(window_w - w) / 2, (window_h - h) / 2, w, h};
+}
 const char* g_shot_dir = nullptr;
 int g_shot_max = 0;
 int g_shot_count = 0;
@@ -57,7 +96,7 @@ GLuint g_program_early = 0, g_active = 0;
 GLuint g_white = 0;
 GLuint g_present_program = 0, g_present_vao = 0;  // the pass that presents an EFB copy through the vertical copy filter
 struct PresentLocations {
-    GLint rect = -1, misc = -1, weights = -1;
+    GLint rect = -1, misc = -1, weights = -1, view = -1;
 } g_present_loc;
 constexpr int kEfbUnit = 7;  // texture unit the EFB's colour texture is bound to while that pass samples it
 bool g_ring_valid = false;  // the vertex buffer holds the ring (an oversized draw replaced it)
@@ -286,11 +325,12 @@ void main() {
 const char* kPresentFragmentShader = R"(#version 330 core
 uniform sampler2D u_efb;
 uniform vec4 u_rect;     // the copied rectangle in EFB texels: x, y of its lowest line (GL rows), width, height
-uniform vec4 u_misc;     // window width and height; lines the filter may read above and below the rectangle (0 or 1)
+uniform vec4 u_misc;     // picture width and height in the window; lines the filter may read above and below the rectangle (0 or 1)
+uniform vec4 u_view;     // x, y of the picture's lower-left corner in the window
 uniform vec4 u_weights;  // line above, line itself, line below, each over 64
 out vec4 o_color;
 void main() {
-    vec2 p = u_rect.xy + gl_FragCoord.xy / u_misc.xy * u_rect.zw;
+    vec2 p = u_rect.xy + (gl_FragCoord.xy - u_view.xy) / u_misc.xy * u_rect.zw;
     vec2 inv = 1.0 / vec2(textureSize(u_efb, 0));
     float x = clamp(p.x, u_rect.x + 0.5, u_rect.x + u_rect.z - 0.5);
     float lo = u_rect.y + 0.5, hi = u_rect.y + u_rect.w - 0.5;
@@ -1274,6 +1314,7 @@ bool init(int window_w, int window_h, const char* screenshot_dir, int max_screen
         } else {
             g_present_loc.rect = glGetUniformLocation(g_present_program, "u_rect");
             g_present_loc.misc = glGetUniformLocation(g_present_program, "u_misc");
+            g_present_loc.view = glGetUniformLocation(g_present_program, "u_view");
             g_present_loc.weights = glGetUniformLocation(g_present_program, "u_weights");
             glUseProgram(g_present_program);
             glUniform1i(glGetUniformLocation(g_present_program, "u_efb"), kEfbUnit);
@@ -1345,6 +1386,7 @@ void shutdown() {
     g_mem.read_guard_hook = nullptr;
     g_mem.guard_count = 0;
     print_feature_use();
+    overlay_glue::stop();
     if (g_context) SDL_GL_DestroyContext(g_context);
     if (g_window) SDL_DestroyWindow(g_window);
     g_context = nullptr;
@@ -1719,7 +1761,8 @@ static void present_filtered(const CopyRequest& r, const State& s, const CopyFil
     glDisable(GL_CULL_FACE);
     glDisable(GL_COLOR_LOGIC_OP);
     glUniform4f(g_present_loc.rect, float(r.x), float(kEfbHeight - (r.y + r.h)), float(r.w), float(r.h));
-    glUniform4f(g_present_loc.misc, float(g_window_w), float(g_window_h), float(above), float(below));
+    glUniform4f(g_present_loc.misc, float(g_present_rect.w), float(g_present_rect.h), float(above), float(below));
+    glUniform4f(g_present_loc.view, float(g_present_rect.x), float(g_present_rect.y), 0.0f, 0.0f);
     glUniform4f(g_present_loc.weights, float(f.above) / 64.0f, float(f.centre) / 64.0f, float(f.below) / 64.0f, 0.0f);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     bind_unit_texture(kEfbUnit, g_white);  // the draws' sampler for this unit must not read the texture they render to
@@ -1907,10 +1950,13 @@ void copy_efb(const CopyRequest& r, const State& s) {
         glViewport(0, 0, g_window_w, g_window_h);
         glClearColor(0, 0, 0, 1);
         glClear(GL_COLOR_BUFFER_BIT);
+        g_present_rect = present_rect_for(g_aspect, g_window_w, g_window_h);
+        glViewport(g_present_rect.x, g_present_rect.y, g_present_rect.w, g_present_rect.h);
         const int sy0 = kEfbHeight - (r.y + r.h), sy1 = kEfbHeight - r.y;
         const CopyFilter filter = copy_filter_of(s, (s.bp[0x43] & 7) == 3);
         if (filter.identity() || !g_present_program) {
-            glBlitFramebuffer(r.x, sy0, r.x + r.w, sy1, 0, 0, g_window_w, g_window_h, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+            glBlitFramebuffer(r.x, sy0, r.x + r.w, sy1, g_present_rect.x, g_present_rect.y, g_present_rect.x + g_present_rect.w,
+                              g_present_rect.y + g_present_rect.h, GL_COLOR_BUFFER_BIT, GL_LINEAR);
         } else {
             ++g_use.filtered_copies;
             present_filtered(r, s, filter);
@@ -1922,6 +1968,16 @@ void copy_efb(const CopyRequest& r, const State& s) {
             win.h = g_window_h;
             win.rgb = read_window_rgb();
         }
+        // The overlay (settings, frame rate) goes over the picture, after the screenshot and the diagnostic capture so
+        // that those show the game alone. It restores the GL state it touches; the renderer's own state is
+        // re-established by the next draw (the shadow was invalidated above).
+        ++g_fps_frames;
+        if (const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_fps_since).count(); dt >= 0.5) {
+            g_fps = g_fps_frames / dt;
+            g_fps_frames = 0;
+            g_fps_since = std::chrono::steady_clock::now();
+        }
+        overlay_glue::draw(g_window_w, g_window_h, g_fps);
         SDL_GL_SwapWindow(g_window);
         SDL_GetWindowSizeInPixels(g_window, &g_window_w, &g_window_h);
     }
@@ -1938,13 +1994,53 @@ void copy_efb(const CopyRequest& r, const State& s) {
     }
 }
 
+// Applies what the settings say to the window, the swap interval, the stick dead zone and, once the game has
+// opened its audio output, the volume and the device.
+static void apply_settings() {
+    const settings::Values v = g_store->values();
+    if (!g_applied_valid || v.video.fullscreen != g_applied.video.fullscreen) SDL_SetWindowFullscreen(g_window, v.video.fullscreen);
+    // A benchmark run (GCRECOMP_BENCH) measures the renderer, not the display: it never waits for the refresh.
+    if (!g_applied_valid || v.video.vsync != g_applied.video.vsync) SDL_GL_SetSwapInterval(v.video.vsync && !bench::g_timing ? 1 : 0);
+    g_aspect = v.video.aspect;
+    input::set_stick_deadzone(v.input.stick_deadzone);
+    audio::AudioSink* sink = ai_hle_sink();
+    if (sink && (sink != g_audio_target || !g_applied_valid || v.audio != g_applied.audio)) {
+        sink->set_volume(v.audio.volume * v.audio.volume);  // the slider is perceptual: the gain is its square
+        if (sink != g_audio_target || !g_applied_valid || v.audio.device != g_applied.audio.device) sink->set_device(v.audio.device);
+        g_audio_target = sink;
+    }
+    g_applied = v;
+    g_applied_valid = true;
+}
+
+void attach_settings(settings::Store& store, const char* manifest) {
+    g_store = &store;
+    overlay_glue::start(g_window, store, manifest ? manifest : "");
+    apply_settings();
+}
+
 bool pump_events() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) g_closed = true;
+        if (overlay_glue::process_event(e)) continue;  // the overlay is open: the game's input does not see it
         input::handle_event(e);
     }
     input::update();
+    if (g_store) {
+        const auto now = std::chrono::steady_clock::now();
+        const bool visible = overlay_glue::visible();
+        // The launcher may edit the files while the game runs: look again once a second, and when the overlay opens.
+        if (now - g_last_reload >= std::chrono::seconds(1) || (visible && !g_overlay_was_visible)) {
+            g_last_reload = now;
+            g_store->reload();
+            if (visible && !g_overlay_was_visible) input::reload_bindings();
+        }
+        g_overlay_was_visible = visible;
+        // The audio sink appears when the game first uses it: apply its settings then, not only when they change.
+        if (g_store->values() != g_applied || (ai_hle_sink() && ai_hle_sink() != g_audio_target)) apply_settings();
+        if (overlay_glue::quit_requested()) g_closed = true;
+    }
     return !g_closed;
 }
 
